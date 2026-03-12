@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>AgarVVV Admin</title>
+    <link rel="icon" type="image/png" href="/assets/img/favicon.png">
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet">
+    <link href="/assets/css/admin.css" rel="stylesheet">
+</head>
+<body>
+    <main class="admin-shell">
+        <header class="admin-header">
+            <div>
+                <div class="eyebrow">AgarVVV Admin</div>
+                <h1>Runtime Control Panel</h1>
+                <p>Manage presets, physics, bots, uploads and world resets without touching the terminal.</p>
+            </div>
+            <div class="header-actions">
+                <a class="ghost-button header-link-button" href="/" target="_blank" rel="noreferrer">Back To Game</a>
+                <span id="sessionState" class="pill">Checking session</span>
+                <button id="logoutBtn" class="ghost-button" hidden>Logout</button>
+            </div>
+        </header>
+
+        <section id="loginView" class="card auth-card">
+            <h2>Admin Login</h2>
+            <form id="loginForm" class="stack">
+                <label>
+                    Username
+                    <input id="loginUsername" type="text" autocomplete="username" value="agar2026vvv">
+                </label>
+                <label>
+                    Password
+                    <input id="loginPassword" type="password" autocomplete="current-password">
+                </label>
+                <button type="submit" class="primary-button">Login</button>
+                <p id="loginMessage" class="message"></p>
+            </form>
+        </section>
+
+        <section id="dashboardView" hidden>
+            <div class="toolbar">
+                <button id="saveLiveBtn" class="primary-button">Save Live</button>
+                <button id="saveResetBtn" class="accent-button">Save + Reset World</button>
+                <button id="powerToggleBtn" class="danger-button" type="button">Shutdown Server</button>
+                <button id="broadcastBtn" class="ghost-button">Broadcast</button>
+                <input id="broadcastMessage" type="text" placeholder="Broadcast message">
+                <span id="powerStateLabel" class="pill">Server online</span>
+                <span id="saveMessage" class="message"></span>
+            </div>
+
+            <div class="dashboard-grid">
+                <section class="card">
+                    <h2>Server</h2>
+                    <div class="form-grid">
+                        <label>Server name<input id="serverName" type="text"></label>
+                        <label>Preset<select id="activePreset"></select></label>
+                        <label>Welcome line 1<input id="serverWelcome1" type="text"></label>
+                        <label>Welcome line 2<input id="serverWelcome2" type="text"></label>
+                        <label>Max human players<input id="serverMaxConnections" type="number" min="1"></label>
+                        <label>IP limit<input id="serverIpLimit" type="number" min="0"></label>
+                        <label>WS endpoint<input id="publicWsEndpoint" type="text"></label>
+                        <label>Scramble level<input id="serverScrambleLevel" type="number" min="0" max="3"></label>
+                        <label>Auto reset (minutes)<input id="serverRestart" type="number" min="0" step="5"></label>
+                        <label>Multi-control avatars<input id="multiControlMaxPilots" type="number" min="1" max="8"></label>
+                        <label class="checkbox-row"><input id="allowSkinUpload" type="checkbox">Allow public skin upload</label>
+                        <label class="checkbox-row"><input id="dualControlEnabled" type="checkbox">Enable multi-control cells</label>
+                    </div>
+                </section>
+
+                <section class="card">
+                    <div class="card-head">
+                        <div>
+                            <h2>Physics</h2>
+                            <p class="card-note">Restore the original launch profile or apply Agar-style baseline values before saving.</p>
+                        </div>
+                        <div class="card-actions">
+                            <button id="physicsProjectDefaultsBtn" class="ghost-button" type="button">Restore Launch Defaults</button>
+                            <button id="physicsVanillaDefaultsBtn" class="ghost-button" type="button">Apply Agar Defaults</button>
+                        </div>
+                    </div>
+                    <div class="form-grid">
+                        <label>Player max cells<input id="playerMaxCells" type="number" min="2" max="64"></label>
+                        <label>Start mass (players/bots/multi)<input id="playerStartSize" type="number" min="1" step="1"></label>
+                        <label>Player speed<input id="playerSpeed" type="number" step="0.01"></label>
+                        <label>Split velocity<input id="splitVelocity" type="number" step="1"></label>
+                        <label>Eject velocity<input id="ejectVelocity" type="number" step="1"></label>
+                        <label>Decay rate<input id="playerDecayRate" type="number" step="0.0001"></label>
+                        <label>Recombine time<input id="playerRecombineTime" type="number" step="1"></label>
+                        <label>Food amount<input id="foodAmount" type="number" step="1"></label>
+                        <label>Virus amount<input id="virusAmount" type="number" step="1"></label>
+                        <label>Border width<input id="borderWidth" type="number" step="1"></label>
+                        <label>Border height<input id="borderHeight" type="number" step="1"></label>
+                    </div>
+                    <div class="map-toolkit">
+                        <div class="map-toolkit-head">
+                            <h3>Map Size Toolkit</h3>
+                            <p class="card-note">המלצות מאוזנות. המספרים כאן הם נקודת פתיחה טובה, לא חוק קשיח.</p>
+                        </div>
+
+                        <div class="map-size-grid">
+                            <article class="map-size-card">
+                                <strong>Compact</strong>
+                                <span class="map-size-value">9000 x 9000</span>
+                                <ul class="toolkit-list">
+                                    <li><strong>Humans:</strong> בערך 20-35</li>
+                                    <li><strong>Bot target:</strong> בערך 30-45</li>
+                                    <li><strong>Food:</strong> בערך 700-900</li>
+                                    <li><strong>Viruses:</strong> בערך 35-45</li>
+                                </ul>
+                            </article>
+
+                            <article class="map-size-card">
+                                <strong>Standard</strong>
+                                <span class="map-size-value">12000 x 12000</span>
+                                <ul class="toolkit-list">
+                                    <li><strong>Humans:</strong> בערך 35-60</li>
+                                    <li><strong>Bot target:</strong> בערך 45-70</li>
+                                    <li><strong>Food:</strong> בערך 950-1300</li>
+                                    <li><strong>Viruses:</strong> בערך 45-60</li>
+                                </ul>
+                            </article>
+
+                            <article class="map-size-card">
+                                <strong>Large</strong>
+                                <span class="map-size-value">14142 x 14142</span>
+                                <ul class="toolkit-list">
+                                    <li><strong>Humans:</strong> בערך 50-80</li>
+                                    <li><strong>Bot target:</strong> בערך 60-95</li>
+                                    <li><strong>Food:</strong> בערך 1300-1800</li>
+                                    <li><strong>Viruses:</strong> בערך 55-75</li>
+                                </ul>
+                            </article>
+
+                            <article class="map-size-card">
+                                <strong>Wide Rectangle</strong>
+                                <span class="map-size-value">16000 x 10000</span>
+                                <ul class="toolkit-list">
+                                    <li><strong>Humans:</strong> בערך 40-70</li>
+                                    <li><strong>Bot target:</strong> בערך 50-80</li>
+                                    <li><strong>Food:</strong> בערך 1100-1500</li>
+                                    <li><strong>Viruses:</strong> בערך 45-60</li>
+                                </ul>
+                            </article>
+                        </div>
+
+                        <div class="toolkit-callout">
+                            <strong>איך לקרוא את זה:</strong> <code>Border width</code> ו־<code>Border height</code> הם גודל העולם עצמו. אם אתה מגדיל את שניהם, אתה מגדיל את שטח המפה משמעותית, ולכן בדרך כלל צריך להעלות גם <code>Food</code> ו־<code>Virus amount</code>. אם <code>Auto-fill with bots</code> מסומן, <code>Bot target</code> הוא יעד כולל של אנשים ובוטים יחד.
+                        </div>
+                    </div>
+                </section>
+
+                <section class="card">
+                    <h2>Bots</h2>
+                    <div class="form-grid">
+                        <label>Target count<input id="botTargetCount" type="number" min="0"></label>
+                        <label class="checkbox-row"><input id="botAutoFill" type="checkbox">Auto-fill with bots</label>
+                    </div>
+                    <div class="profile-toolbar">
+                        <button id="addProfileBtn" class="ghost-button" type="button">Add Profile</button>
+                    </div>
+                    <div id="profilesList" class="profiles-list"></div>
+                </section>
+
+                <section class="card toolkit-card">
+                    <h2>Toolkit</h2>
+                    <p class="card-note">הסבר פשוט על פרופילי הבוטים ומה כל שדה באמת עושה.</p>
+
+                    <div class="toolkit-block">
+                        <h3>מה כל שדה עושה</h3>
+                        <ul class="toolkit-list">
+                            <li><strong>Label</strong>: שם פנימי בשבילך במסך הניהול. לא משנה את הכוח של הבוט.</li>
+                            <li><strong>Logic</strong>: סוג ההתנהגות של הבוט.</li>
+                            <li><strong>Skin</strong>: המראה של הבוט. יש להזין שם של סקין קיים מתוך Available Skins.</li>
+                            <li><strong>Random skin</strong>: אם מסומן, הבוט יקבל בכל spawn סקין אקראי מתוך הגלריה במקום הסקין הידני.</li>
+                            <li><strong>Spawn weight</strong>: קובע כמה פעמים הפרופיל הזה ייבחר יחסית לאחרים. זה לא כוח.</li>
+                            <li><strong>Name prefix</strong>: תחילת השם של הבוטים מהפרופיל הזה.</li>
+                        </ul>
+                    </div>
+
+                    <div class="toolkit-block">
+                        <h3>פירוש Logic</h3>
+                        <ul class="toolkit-list">
+                            <li><strong>Balanced</strong>: בוט מאוזן. גם אוסף אוכל וגם תוקף כשיש הזדמנות.</li>
+                            <li><strong>Hunter</strong>: בוט אגרסיבי. מחפש יותר לחסל שחקנים ובוטים אחרים.</li>
+                            <li><strong>NEW HUNTER</strong>: בוט אגרסיבי עם split מדורג לפי מסה ומספר תאים, כדי להישאר חם בלי להתפרק מהר מדי.</li>
+                            <li><strong>TEAM-BOTS</strong>: בוט קבוצתי בסגנון NEW HUNTER, עם spike-shot הגנתי, חיזוק חברים ב־W והעברת חלקים בין חברי הקבוצה כשזה משתלם יותר ממרדף קטן.</li>
+                            <li><strong>Collector</strong>: בוט שאוסף יותר אוכל ומסה ופחות מחפש קרבות.</li>
+                            <li><strong>Survivor</strong>: בוט זהיר. בורח יותר מסכנות, מתפצל פחות ומשחק שמרני.</li>
+                            <li><strong>NEW SURVIVOR</strong>: בוט זהיר שבמסה גבוהה יכול לבצע spike-shot מבוקר דרך קוץ על איום גדול, עם cooldown כדי לא להספים.</li>
+                        </ul>
+                    </div>
+
+                    <div class="toolkit-block">
+                        <h3>איך Spawn weight עובד</h3>
+                        <p class="toolkit-text">המספר קובע שכיחות הופעה, לא כוח. אם יש פרופילים עם משקלים 3, 2, 1 אז הראשון יופיע בערך חצי מהזמן, השני בערך שליש, והשלישי בערך שישית.</p>
+                    </div>
+
+                    <div class="toolkit-block">
+                        <h3>מה הפרופיל לא שולט עליו</h3>
+                        <p class="toolkit-text">הפרופיל לא קובע מהירות בסיסית, גודל פתיחה, decay או פיזיקה כללית. הדברים האלה נקבעים באזור Physics ומשפיעים על כל השרת.</p>
+                    </div>
+
+                    <div class="toolkit-callout">
+                        <strong>חשוב:</strong> <code>Save Live</code> שומר את ההגדרות מיד, אבל בפועל הוא משפיע בעיקר על בוטים חדשים. אם אתה רוצה שכל הבוטים הקיימים יקבלו את ההגדרות החדשות, השתמש ב־<code>Save + Reset World</code>.
+                    </div>
+                </section>
+
+                <section class="card">
+                    <h2>Presets JSON</h2>
+                    <textarea id="modePresetsJson" rows="18"></textarea>
+                </section>
+
+                <section class="card">
+                    <h2>Live State</h2>
+                    <div id="serverState" class="state-grid"></div>
+                </section>
+
+                <section class="card">
+                    <h2>Available Skins</h2>
+                    <div class="admin-upload-panel">
+                        <div class="admin-upload-copy">
+                            <strong>Admin Upload</strong>
+                            <p class="card-note">Uploads from the admin panel do not use the public per-IP upload throttle.</p>
+                        </div>
+                        <form id="adminSkinUploadForm" class="admin-upload-form">
+                            <input id="adminSkinUploadName" type="text" placeholder="Skin label">
+                            <input id="adminSkinUploadInput" type="file" accept="image/png,image/jpeg,.jpg,.jpeg">
+                            <button id="adminSkinUploadButton" class="primary-button" type="submit">Upload Skin</button>
+                        </form>
+                        <div id="adminSkinUploadStatus" class="message upload-message">PNG, JPG and JPEG are supported. The image will be converted to a game-ready PNG.</div>
+                    </div>
+                    <div class="section-meta">
+                        <span id="skinGallerySummary" class="message"></span>
+                        <div id="skinGalleryPagination" class="pagination-bar"></div>
+                    </div>
+                    <div id="skinGallery" class="skin-gallery"></div>
+                </section>
+            </div>
+        </section>
+    </main>
+
+    <template id="profileTemplate">
+        <article class="profile-card">
+            <div class="profile-head">
+                <strong class="profile-title">Bot Profile</strong>
+                <button class="delete-profile" type="button">Remove</button>
+            </div>
+            <div class="form-grid compact">
+                <label>Label<input data-field="label" type="text"></label>
+                <label>Logic
+                    <select data-field="logic">
+                        <option value="balanced">Balanced</option>
+                        <option value="hunter">Hunter</option>
+                        <option value="new-hunter">NEW HUNTER</option>
+                        <option value="team-bots">TEAM-BOTS</option>
+                        <option value="collector">Collector</option>
+                        <option value="survivor">Survivor</option>
+                        <option value="new-survivor">NEW SURVIVOR</option>
+                    </select>
+                </label>
+                <label>Skin<input data-field="skin" type="text"></label>
+                <label class="checkbox-row"><input data-field="randomSkin" type="checkbox">Random skin</label>
+                <label>Spawn weight<input data-field="spawnWeight" type="number" min="1"></label>
+                <label>Name prefix<input data-field="namePrefix" type="text"></label>
+            </div>
+        </article>
+    </template>
+
+    <script defer src="/assets/js/admin.js"></script>
+</body>
+</html>

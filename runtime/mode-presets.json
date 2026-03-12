@@ -1,0 +1,61 @@
+{
+  "presets": {
+    "ffa": {
+      "label": "FFA Classic",
+      "description": "Classic Agar feel with 16 cells and standard pacing.",
+      "config": {
+        "serverGamemode": 0,
+        "serverName": "AgarVVV FFA",
+        "playerMaxCells": 16,
+        "playerSpeed": 1,
+        "splitVelocity": 780,
+        "ejectVelocity": 780,
+        "playerDecayRate": 0.002,
+        "playerRecombineTime": 30,
+        "foodAmount": 850,
+        "virusAmount": 60,
+        "borderWidth": 14142.135623730952,
+        "borderHeight": 14142.135623730952,
+        "playerStartSize": 20
+      }
+    },
+    "vanilla": {
+      "label": "Vanilla Agar",
+      "description": "Agar-style baseline values with lighter food and virus density.",
+      "config": {
+        "serverGamemode": 0,
+        "serverName": "AgarVVV Vanilla",
+        "playerMaxCells": 16,
+        "playerSpeed": 1,
+        "splitVelocity": 780,
+        "ejectVelocity": 780,
+        "playerDecayRate": 0.002,
+        "playerRecombineTime": 30,
+        "foodAmount": 700,
+        "virusAmount": 50,
+        "borderWidth": 14142.135623730952,
+        "borderHeight": 14142.135623730952,
+        "playerStartSize": 10
+      }
+    },
+    "agarx": {
+      "label": "AGARX",
+      "description": "Faster, denser preset designed around 32-way split play.",
+      "config": {
+        "serverGamemode": 4,
+        "serverName": "AgarVVV AGARX",
+        "playerMaxCells": 32,
+        "playerSpeed": 1.08,
+        "splitVelocity": 845,
+        "ejectVelocity": 820,
+        "playerDecayRate": 0.0024,
+        "playerRecombineTime": 24,
+        "foodAmount": 1100,
+        "virusAmount": 80,
+        "borderWidth": 14142.135623730952,
+        "borderHeight": 14142.135623730952,
+        "playerStartSize": 20
+      }
+    }
+  }
+}

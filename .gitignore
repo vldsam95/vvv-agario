@@ -1,0 +1,11 @@
+**/node_modules/
+.playwright-cli/
+.DS_Store
+npm-debug.log*
+yarn-error.log*
+
+# Runtime secrets and volatile state
+runtime/admin.json
+runtime/control.json
+runtime/server-state.json
+runtime/public-skin-quota.json

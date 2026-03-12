@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Eat cells smaller than you and don't get eaten by the bigger ones, as an MMO">
+    <meta name="keywords" content="agario, agar, io, cell, cells, virus, bacteria, blob, game, games, web game, html5, fun, flash">
+    <meta name="robots" content="index, follow">
+    <meta name="viewport" content="minimal-ui, width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+
+    <title>AgarVVV Arena</title>
+
+    <link id="favicon" rel="icon" type="image/png" href="assets/img/favicon.png">
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet" type="text/css">
+    <link href="https://maxcdn.bootstrapcdn.com/bootstrap/3.3.4/css/bootstrap.min.css" rel="stylesheet">
+    <link href="assets/css/index.css" rel="stylesheet">
+    <link href="assets/css/gallery.css" rel="stylesheet">
+    <link href="assets/css/agarvvv.css" rel="stylesheet">
+
+    <script src="assets/js/quadtree.js"></script>
+    <script src="/runtime-config.js"></script>
+    <script src="assets/js/main_out.js?v=20260312-skinslots"></script>
+    <script defer src="assets/js/agarvvv-ui.js?v=20260312-skinslots"></script>
+</head>
+
+<body>
+    <div id="gallery" onclick="if (event.target == this) this.hide()" style="display: none;">
+        <div id="gallery-content">
+            <div id="gallery-header">Skins</div>
+            <div id="gallery-body"></div>
+        </div>
+    </div>
+    <div id="overlays" style="display: none;">
+        <div id="helloDialog">
+            <div class="hero-copy">
+                <div class="hero-kicker">MultiOgarII + Cigar2</div>
+                <h1 id="title">AgarVVV Arena</h1>
+                <p id="hero-subtitle" class="hero-subtitle">Custom runtime presets, multi-cell control, bot profiles and skin uploads on one server.</p>
+            </div>
+
+            <div class="hero-grid">
+                <section class="hero-panel form-panel">
+                    <div class="panel-heading-line">
+                        <span>Enter Arena</span>
+                        <span id="server-status-badge" class="status-badge">Syncing...</span>
+                    </div>
+                    <div class="form-group arena-fields">
+                        <input id="nick" class="form-control" placeholder="Nickname" maxlength="15">
+                        <div class="skin-selection-grid">
+                            <article class="skin-choice-card skin-choice-card-main">
+                                <div class="skin-choice-head">
+                                    <div>
+                                        <strong>Main Skin</strong>
+                                        <p>Your primary arena skin.</p>
+                                    </div>
+                                    <span class="skin-choice-tag">Main</span>
+                                </div>
+                                <div class="skin-choice-body">
+                                    <div id="skin-preview-main-shell" class="skin-choice-preview is-empty">
+                                        <img id="skin-preview-main" alt="Main skin preview" hidden>
+                                        <span>Main</span>
+                                    </div>
+                                    <div class="skin-choice-controls">
+                                        <input id="skin" class="form-control" placeholder="Choose main skin">
+                                        <button class="skin-choice-button" type="button" onclick="openSkinsList('skin')">Gallery for Main</button>
+                                    </div>
+                                </div>
+                            </article>
+
+                            <article class="skin-choice-card skin-choice-card-multi">
+                                <div class="skin-choice-head">
+                                    <div>
+                                        <strong>Multi Skin</strong>
+                                        <p>Used for the extra avatar from Tab.</p>
+                                    </div>
+                                    <span class="skin-choice-tag">Multi</span>
+                                </div>
+                                <div class="skin-choice-body">
+                                    <div id="skin-preview-multi-shell" class="skin-choice-preview is-empty">
+                                        <img id="skin-preview-multi" alt="Multi skin preview" hidden>
+                                        <span>Multi</span>
+                                    </div>
+                                    <div class="skin-choice-controls">
+                                        <input id="multiSkin" class="form-control" placeholder="Choose multi skin">
+                                        <button class="skin-choice-button" type="button" onclick="openSkinsList('multiSkin')">Gallery for Multi</button>
+                                    </div>
+                                </div>
+                            </article>
+                        </div>
+                        <div class="skin-selection-tip">Main is your first cell. Multi is the extra avatar spawned with <b>Tab</b>.</div>
+                        <select id="gamemode" class="form-control" onchange="setserver(this.value)" required>
+                            <option value="/ws" selected>Main Arena</option>
+                        </select>
+                    </div>
+                    <div class="cta-row">
+                        <button id="play-btn" class="btn btn-play btn-primary btn-needs-server">Play</button>
+                        <button id="spectate-btn" onclick="spectate()" class="btn btn-warning btn-spectate btn-needs-server glyphicon glyphicon-eye-open"></button>
+                        <button id="gallery-btn" onclick="openSkinsList()" class="btn btn-play btn-primary btn-needs-server btn-info">Gallery</button>
+                    </div>
+                </section>
+
+                <section class="hero-panel status-panel">
+                    <div class="panel-heading-line">
+                        <span>Server Status</span>
+                        <span id="runtime-mode">Arena</span>
+                    </div>
+                    <div class="metric-grid">
+                        <div class="metric-card">
+                            <span class="metric-label">Humans</span>
+                            <strong id="runtime-humans">0</strong>
+                        </div>
+                        <div class="metric-card">
+                            <span class="metric-label">Bots</span>
+                            <strong id="runtime-bots">0</strong>
+                        </div>
+                        <div class="metric-card">
+                            <span class="metric-label">Leader</span>
+                            <strong id="runtime-leader">-</strong>
+                        </div>
+                        <div class="metric-card">
+                            <span class="metric-label">Update</span>
+                            <strong id="runtime-updated">-</strong>
+                        </div>
+                    </div>
+                    <ul class="hotkey-list">
+                        <li><b>Space</b> split</li>
+                        <li><b>D</b> double split</li>
+                        <li><b>Z</b> quad split</li>
+                        <li><b>W</b> eject mass</li>
+                        <li><b>R</b> respawn the active player</li>
+                        <li><b>Q</b> minion toggle</li>
+                        <li><b>Tab</b> spawn or switch player</li>
+                        <li><b>Shift + Tab</b> return to the primary player</li>
+                        <li><b>Enter</b> chat</li>
+                    </ul>
+                </section>
+
+                <section class="hero-panel upload-panel">
+                    <div class="panel-heading-line">
+                        <span>Skin Upload</span>
+                        <span>PNG / JPG / JPEG</span>
+                    </div>
+                    <form id="skin-upload-form">
+                        <input id="skin-upload-name" class="form-control" placeholder="Skin label">
+                        <input id="skin-upload-input" class="form-control" type="file" accept="image/png,image/jpeg,.jpg,.jpeg">
+                        <button id="skin-upload-button" class="btn btn-play btn-primary" type="submit">Upload Skin</button>
+                    </form>
+                    <div id="skin-upload-status" class="upload-status">Upload a PNG, JPG or JPEG and it will be converted safely to a game-ready skin.</div>
+                    <div class="skin-preview-card">
+                        <img id="skin-preview" src="skins/doge.png" alt="Skin preview">
+                    </div>
+                </section>
+            </div>
+
+            <div id="settings" class="hero-panel settings-panel">
+                <div class="panel-heading-line">
+                    <span>Client Settings</span>
+                    <span>Saved locally</span>
+                </div>
+                <div class="settings-grid">
+                    <label><input id="showSkins" type="checkbox">Skins</label>
+                    <label><input id="showNames" type="checkbox">Names</label>
+                    <label><input id="darkTheme" type="checkbox">Dark theme</label>
+                    <label><input id="showColor" type="checkbox">Cell colors</label>
+                    <label><input id="showMass" type="checkbox">Mass</label>
+                    <label><input id="showChat" type="checkbox">Chat</label>
+                    <label><input id="showMinimap" type="checkbox">Minimap</label>
+                    <label><input id="showPosition" type="checkbox">Coordinates</label>
+                    <label><input id="showBorder" type="checkbox">Border</label>
+                    <label><input id="showGrid" type="checkbox">Grid</label>
+                    <label><input id="moreZoom" type="checkbox">Extra zoom-out</label>
+                    <label><input id="fillSkin" type="checkbox">Fill skin</label>
+                    <label><input id="backgroundSectors" type="checkbox">Sector grid</label>
+                    <label><input id="jellyPhysics" type="checkbox">Jelly physics</label>
+                    <label><input id="playSounds" type="checkbox">Sounds</label>
+                    <label class="sound-slider">
+                        Volume
+                        <input id="soundsVolume" type="range" min="0" max="1" step="any">
+                    </label>
+                </div>
+            </div>
+
+            <div id="footer">
+                <span class="text-muted">Built for `agarvvv.greener-business.com`</span>
+            </div>
+        </div>
+    </div>
+
+    <div id="connecting">
+        <div id="connecting-content">
+            <h2>Connecting</h2>
+            <p> If you cannot connect to the servers, check if you have some anti virus or firewall blocking the connection.</p>
+        </div>
+    </div>
+
+    <div id="mobileStuff" style="display: none;">
+        <div id="touchpad"></div>
+        <div id="touchCircle" style="display: none;"></div>
+        <img src="/assets/img/split.png" id="splitBtn">
+        <img src="/assets/img/eject.png" id="ejectBtn">
+    </div>
+
+    <canvas id="canvas" width="800" height="600"></canvas>
+    <input type="text" id="chat_textbox" placeholder="Press enter to chat" maxlength="200">
+    <div style="font-family:'Ubuntu'">&nbsp;</div>
+</body>
+</html>

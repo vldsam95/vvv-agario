@@ -1,0 +1,51 @@
+{
+  "targetCount": 65,
+  "autoFill": true,
+  "profiles": [
+    {
+      "id": "balanced-core",
+      "label": "Balanced Core",
+      "logic": "balanced",
+      "skin": "doge",
+      "randomSkin": true,
+      "spawnWeight": 3,
+      "namePrefix": "۞ẒṠ۞"
+    },
+    {
+      "id": "hunters",
+      "label": "Hunters",
+      "logic": "new-hunter",
+      "skin": "",
+      "randomSkin": true,
+      "spawnWeight": 2,
+      "namePrefix": "✦𝓔𝓓✦"
+    },
+    {
+      "id": "collectors",
+      "label": "Collectors",
+      "logic": "collector",
+      "skin": "kraken-jpg-03f345",
+      "randomSkin": false,
+      "spawnWeight": 2,
+      "namePrefix": "CL"
+    },
+    {
+      "id": "survivors",
+      "label": "Survivors",
+      "logic": "new-survivor",
+      "skin": "",
+      "randomSkin": true,
+      "spawnWeight": 1,
+      "namePrefix": "SV"
+    },
+    {
+      "id": "profile-1773344919645",
+      "label": "New Profile",
+      "logic": "team-bots",
+      "skin": "",
+      "randomSkin": true,
+      "spawnWeight": 1,
+      "namePrefix": "「彣」"
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+{
+  "username": "replace-me",
+  "salt": "hex-salt-generated-on-server",
+  "passwordHash": "hex-password-hash-generated-on-server"
+}
