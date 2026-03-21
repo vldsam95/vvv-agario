@@ -9,3 +9,5 @@ runtime/admin.json
 runtime/control.json
 runtime/server-state.json
 runtime/public-skin-quota.json
+runtime/ws-ticket-secret.json
+runtime/logs/

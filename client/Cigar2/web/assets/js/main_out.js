@@ -1,6 +1,8 @@
 (function() {
     'use strict';
 
+    window.__AGAR_MAIN_SCRIPT_LOADED = true;
+
     if (typeof WebSocket === 'undefined' || typeof DataView === 'undefined' ||
         typeof ArrayBuffer === 'undefined' || typeof Uint8Array === 'undefined') {
         alert('Your browser does not support required features, please update your browser or get a new one.');
@@ -220,9 +222,22 @@
 
     const WEBSOCKET_URL = window.AGAR_CONFIG?.defaultWsEndpoint || null;
     const FALLBACK_WS_URL = '/ws';
+    const WS_TICKET_ENDPOINT = window.AGAR_CONFIG?.wsTicketEndpoint || '/api/public/ws-ticket';
+    const CONNECTION_REPORT_ENDPOINT = window.AGAR_CONFIG?.connectionReportEndpoint || '/api/public/connection-report';
     const SKIN_URL = './skins/';
     const USE_HTTPS = 'https:' === window.location.protocol;
+    const RESUME_SESSION_STORAGE_KEY = 'agarvvv_resume_id';
     const EMPTY_NAME = 'An unnamed cell';
+    const DEFAULT_CONNECTING_TITLE = 'Connecting';
+    const DEFAULT_CONNECTING_MESSAGE = 'Establishing a secure connection to the arena.';
+    const CONNECTION_REPORT_VERSION = '2025-03-connection-diagnostics-v1';
+    const CLIENT_BOOTSTRAP_REPORT_VERSION = '2026-03-client-bootstrap-v1';
+    const WS_TICKET_TIMEOUT_MS = 12000;
+    const WS_TICKET_REFRESH_BUFFER_MS = 5000;
+    const WS_TICKET_RETRY_ATTEMPTS = 2;
+    const WS_TICKET_RETRY_DELAY_MS = 1200;
+    const RECONNECT_RECOVERY_DELAY_MS = 1800;
+    const RECONNECT_RECOVERY_MAX_ATTEMPTS = 8;
     const QUADTREE_MAX_POINTS = 32;
     const CELL_POINTS_MIN = 5;
     const CELL_POINTS_MAX = 120;
@@ -276,6 +291,401 @@
         return `ws${USE_HTTPS ? 's' : ''}://${url}`;
     }
 
+    function buildSocketUrl(url, ticket) {
+        const socketUrl = new URL(resolveWsUrl(url), window.location.href);
+        if (ticket) socketUrl.searchParams.set('ws_ticket', ticket);
+        else socketUrl.searchParams.delete('ws_ticket');
+        if (wsResumeId) socketUrl.searchParams.set('resume_id', wsResumeId);
+        return socketUrl.toString();
+    }
+
+    function createResumeSessionId() {
+        try {
+            if (window.crypto && typeof window.crypto.getRandomValues === 'function') {
+                const bytes = new Uint8Array(16);
+                window.crypto.getRandomValues(bytes);
+                return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+            }
+        } catch (error) {
+            Logger.warn(error);
+        }
+        return `${Date.now().toString(16)}${Math.random().toString(16).slice(2, 18)}`;
+    }
+
+    function getResumeSessionId() {
+        try {
+            const stored = window.sessionStorage?.getItem(RESUME_SESSION_STORAGE_KEY);
+            if (stored && /^[a-f0-9]{24,64}$/i.test(stored)) return stored;
+            const created = createResumeSessionId();
+            window.sessionStorage?.setItem(RESUME_SESSION_STORAGE_KEY, created);
+            return created;
+        } catch (error) {
+            Logger.warn(error);
+            return createResumeSessionId();
+        }
+    }
+
+    function createDiagnosticId() {
+        return `diag-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    }
+
+    function sanitizeDiagnosticValue(value, maxLength = 180) {
+        return String(value || '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
+    }
+
+    function shortenDiagnosticValue(value, head = 8, tail = 4) {
+        const text = sanitizeDiagnosticValue(value, 128);
+        if (!text) return '-';
+        if (text.length <= head + tail + 1) return text;
+        return `${text.slice(0, head)}...${text.slice(-tail)}`;
+    }
+
+    function getOnlineStateText(value) {
+        if (value === true) return 'true';
+        if (value === false) return 'false';
+        return 'unknown';
+    }
+
+    function getClientNetworkSnapshot() {
+        const connection = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+        return {
+            effectiveType: sanitizeDiagnosticValue(connection?.effectiveType, 24),
+            rtt: Number.isFinite(connection?.rtt) ? Math.max(0, Math.round(connection.rtt)) : 0,
+            downlinkMbps: Number.isFinite(connection?.downlink)
+                ? Math.max(0, Math.round(connection.downlink * 100) / 100)
+                : 0,
+        };
+    }
+
+    function buildClientBootstrapDetails(state) {
+        const lines = [
+            `diag_id=${sanitizeDiagnosticValue(state.diagId || '-', 64)}`,
+            `time_utc=${sanitizeDiagnosticValue(state.time || new Date().toISOString(), 48)}`,
+            `stage=${sanitizeDiagnosticValue(state.stage || 'bootstrap', 48)}`,
+            `severity=${sanitizeDiagnosticValue(state.severity || 'error', 24)}`,
+            `context=${sanitizeDiagnosticValue(state.context || '-', 48)}`,
+            `title=${sanitizeDiagnosticValue(state.title || '-', 120)}`,
+            `message=${sanitizeDiagnosticValue(state.message || '-', 220)}`,
+            `error_name=${sanitizeDiagnosticValue(state.errorName || '-', 80)}`,
+            `error_message=${sanitizeDiagnosticValue(state.errorMessage || '-', 220)}`,
+            `page=${sanitizeDiagnosticValue(window.location.pathname || '/', 180)}`,
+            `browser_lang=${sanitizeDiagnosticValue(navigator.language || '-', 32)}`,
+            `browser_ua=${sanitizeDiagnosticValue(navigator.userAgent || '-', 160)}`,
+            `visibility=${sanitizeDiagnosticValue(document.visibilityState || '-', 24)}`,
+            `online=${getOnlineStateText(typeof navigator.onLine === 'boolean' ? navigator.onLine : undefined)}`,
+            `resume_session=${shortenDiagnosticValue(wsResumeId)}`,
+        ];
+        const stack = sanitizeDiagnosticValue(state.stack || '', 900);
+        if (stack) lines.push(`stack=${stack}`);
+        return lines.join('\n');
+    }
+
+    function sendClientBootstrapReport(state) {
+        if (!CONNECTION_REPORT_ENDPOINT || typeof fetch !== 'function' || !state) {
+            return Promise.resolve();
+        }
+        const signature = [
+            state.stage || '-',
+            state.context || '-',
+            state.errorName || '-',
+            state.errorMessage || '-',
+        ].join('|');
+        if (bootstrapReportSignatures.has(signature)) {
+            return Promise.resolve();
+        }
+        bootstrapReportSignatures.add(signature);
+        const diagId = state.diagId || createDiagnosticId();
+        const detailsText = buildClientBootstrapDetails(Object.assign({}, state, {diagId}));
+        const network = getClientNetworkSnapshot();
+        return fetch(CONNECTION_REPORT_ENDPOINT, {
+            method: 'POST',
+            cache: 'no-store',
+            credentials: 'same-origin',
+            keepalive: true,
+            headers: {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                diagId,
+                reportVersion: CLIENT_BOOTSTRAP_REPORT_VERSION,
+                connectionIntent: 'bootstrap',
+                stage: sanitizeDiagnosticValue(state.stage || 'bootstrap', 48),
+                severity: sanitizeDiagnosticValue(state.severity || 'error', 24),
+                title: sanitizeDiagnosticValue(state.title || 'Client bootstrap issue', 120),
+                message: sanitizeDiagnosticValue(state.message || 'The page hit a startup error.', 240),
+                detailsText,
+                page: window.location.pathname,
+                sessionId: wsResumeId,
+                ui: {
+                    status: sanitizeDiagnosticValue(state.title || 'Client bootstrap issue', 32),
+                    visibleNotice: !!state.visibleNotice,
+                },
+                ws: {
+                    target: '',
+                    candidate: '',
+                    closeCode: 0,
+                    closeReason: '',
+                    opened: false,
+                    stable: false,
+                    readyState: 0,
+                    candidateIndex: 1,
+                    candidateCount: 1,
+                },
+                ticket: {
+                    requestId: '',
+                    result: state.stage || 'bootstrap',
+                    attempts: 0,
+                    timeoutMs: 0,
+                    expiresAt: '',
+                },
+                client: {
+                    online: typeof navigator.onLine === 'boolean' ? navigator.onLine : null,
+                    language: navigator.language || '',
+                    visibilityState: document.visibilityState || '',
+                    userAgent: navigator.userAgent || '',
+                },
+                network,
+            }),
+        }).catch((error) => {
+            Logger.warn(error);
+        });
+    }
+
+    function readStoredSettings() {
+        let text = null;
+        try {
+            text = localStorage.getItem('settings');
+        } catch (error) {
+            Logger.warn('Failed to read persisted settings:', error);
+            void sendClientBootstrapReport({
+                stage: 'settings_storage_unavailable',
+                severity: 'warning',
+                title: 'Client settings unavailable',
+                message: 'Local browser storage could not be read. Defaults were used instead.',
+                context: 'load_settings',
+                errorName: error?.name || 'StorageError',
+                errorMessage: error?.message || 'localStorage.getItem failed',
+                stack: error?.stack || '',
+                time: new Date().toISOString(),
+                visibleNotice: false,
+            });
+            return null;
+        }
+        if (!text) return null;
+        try {
+            const parsed = JSON.parse(text);
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                throw new Error('Stored settings must be a JSON object.');
+            }
+            return parsed;
+        } catch (error) {
+            Logger.warn('Failed to parse persisted settings, clearing saved value.', error);
+            try {
+                localStorage.removeItem('settings');
+            } catch (storageError) {
+                Logger.warn('Failed to clear persisted settings:', storageError);
+            }
+            void sendClientBootstrapReport({
+                stage: 'settings_storage_reset',
+                severity: 'warning',
+                title: 'Corrupted client settings reset',
+                message: 'The browser had invalid saved settings. They were cleared and replaced with defaults.',
+                context: 'load_settings',
+                errorName: error?.name || 'SyntaxError',
+                errorMessage: error?.message || 'Invalid JSON in localStorage settings',
+                stack: error?.stack || '',
+                time: new Date().toISOString(),
+                visibleNotice: false,
+            });
+            return null;
+        }
+    }
+
+    function coerceStoredSettingValue(defaultValue, value) {
+        if (typeof defaultValue === 'boolean') {
+            return value === true || value === false ? value : defaultValue;
+        }
+        if (typeof defaultValue === 'number') {
+            const numericValue = Number(value);
+            return Number.isFinite(numericValue) ? numericValue : defaultValue;
+        }
+        if (typeof defaultValue === 'string') {
+            return typeof value === 'string' ? value : defaultValue;
+        }
+        return value;
+    }
+
+    function showBootstrapFailureUi(state) {
+        const overlays = byId('overlays');
+        if (overlays) {
+            overlays.style.display = '';
+            overlays.style.opacity = 1;
+        }
+        const connecting = byId('connecting');
+        if (connecting) connecting.style.display = 'none';
+        const title = byId('connection-notice-title');
+        const message = byId('connection-notice-message');
+        const details = byId('connection-notice-details');
+        const copyButton = byId('connection-notice-copy');
+        const hint = byId('connection-notice-hint');
+        const notice = byId('connection-notice');
+        const detailText = state.detailsText || '';
+        if (title) title.textContent = state.title || 'Client startup failed';
+        if (message) message.textContent = state.message || 'The page hit a startup error. Refresh and try again.';
+        if (details) {
+            details.textContent = detailText;
+            details.hidden = !detailText;
+        }
+        if (copyButton) {
+            copyButton.hidden = !detailText;
+            copyButton.textContent = 'Copy diagnostic text';
+            copyButton.onclick = !detailText ? null : () => {
+                if (typeof navigator.clipboard?.writeText === 'function') {
+                    navigator.clipboard.writeText(detailText).then(() => {
+                        copyButton.textContent = 'Copied';
+                        window.setTimeout(() => {
+                            copyButton.textContent = 'Copy diagnostic text';
+                        }, 1600);
+                    }).catch((error) => {
+                        Logger.warn(error);
+                    });
+                }
+            };
+        }
+        if (hint) {
+            hint.hidden = !detailText;
+            hint.textContent = detailText
+                ? 'If this happens again, send the diagnostic text below to support.'
+                : '';
+        }
+        if (notice) notice.hidden = false;
+        const badge = byId('server-status-badge');
+        if (badge) badge.textContent = 'Error';
+        setPlayButtonsDisabled(true);
+    }
+
+    function handleBootstrapFailure(error, context) {
+        if (bootstrapFailureHandled) return;
+        bootstrapFailureHandled = true;
+        Logger.error(error);
+        const state = {
+            diagId: createDiagnosticId(),
+            stage: 'bootstrap_error',
+            severity: 'error',
+            title: 'Client startup failed',
+            message: 'This browser hit a startup error before the arena UI finished loading. Refresh the page and try again.',
+            context: sanitizeDiagnosticValue(context || 'bootstrap', 48),
+            errorName: sanitizeDiagnosticValue(error?.name || 'Error', 80),
+            errorMessage: sanitizeDiagnosticValue(error?.message || String(error || 'Unknown startup error'), 220),
+            stack: sanitizeDiagnosticValue(error?.stack || '', 900),
+            time: new Date().toISOString(),
+            visibleNotice: true,
+        };
+        state.detailsText = buildClientBootstrapDetails(state);
+        showBootstrapFailureUi(state);
+        if (window.__AGAR_BOOT_GUARD && typeof window.__AGAR_BOOT_GUARD.markInitDone === 'function') {
+            window.__AGAR_BOOT_GUARD.markInitDone();
+        }
+        void sendClientBootstrapReport(state);
+    }
+
+    function summarizeWsTarget(url) {
+        try {
+            const parsed = new URL(resolveWsUrl(url || FALLBACK_WS_URL), window.location.href);
+            return `${parsed.origin}${parsed.pathname}`;
+        } catch (error) {
+            return sanitizeDiagnosticValue(url || FALLBACK_WS_URL, 200);
+        }
+    }
+
+    function createConnectionDiagnostic(url) {
+        return {
+            diagId: createDiagnosticId(),
+            createdAt: new Date().toISOString(),
+            reportVersion: CONNECTION_REPORT_VERSION,
+            connectionIntent,
+            stage: 'initializing',
+            severity: 'info',
+            title: '',
+            message: '',
+            target: summarizeWsTarget(url),
+            candidate: sanitizeDiagnosticValue(url || FALLBACK_WS_URL, 200),
+            candidateIndex: wsCandidateIndex + 1,
+            candidateCount: wsCandidates.length,
+            sessionId: wsResumeId,
+            ticketRequestId: '',
+            ticketResult: 'not_requested',
+            ticketAttempts: 0,
+            ticketTimeoutMs: 0,
+            ticketExpiresAt: '',
+            wsOpened: false,
+            wsStable: false,
+            wsCloseCode: 0,
+            wsCloseReason: '',
+            wsReadyState: 0,
+            reportStatus: 'not_sent',
+            reportRequestId: '',
+            final: false,
+        };
+    }
+
+    function ensureConnectionDiagnostic(url, reset) {
+        if (
+            reset ||
+            !activeConnectionDiagnostic ||
+            activeConnectionDiagnostic.final === true ||
+            activeConnectionDiagnostic.connectionIntent !== connectionIntent
+        ) {
+            activeConnectionDiagnostic = createConnectionDiagnostic(url || wsUrl || FALLBACK_WS_URL);
+        }
+        activeConnectionDiagnostic.connectionIntent = connectionIntent;
+        activeConnectionDiagnostic.target = summarizeWsTarget(url || wsUrl || FALLBACK_WS_URL);
+        activeConnectionDiagnostic.candidate = sanitizeDiagnosticValue(url || wsUrl || FALLBACK_WS_URL, 200);
+        activeConnectionDiagnostic.candidateIndex = wsCandidateIndex + 1;
+        activeConnectionDiagnostic.candidateCount = wsCandidates.length;
+        activeConnectionDiagnostic.wsReadyState = ws ? ws.readyState : 0;
+        return activeConnectionDiagnostic;
+    }
+
+    function updateConnectionDiagnostic(patch, reset) {
+        const diagnostic = ensureConnectionDiagnostic(wsUrl || FALLBACK_WS_URL, reset);
+        Object.assign(diagnostic, patch || {});
+        return diagnostic;
+    }
+
+    function buildConnectionSupportText(state) {
+        const diagnostic = ensureConnectionDiagnostic(wsUrl || FALLBACK_WS_URL);
+        return [
+            `diag_id=${diagnostic.diagId}`,
+            `time_utc=${diagnostic.createdAt}`,
+            `ui_title=${sanitizeDiagnosticValue(state?.title || diagnostic.title || '-', 120)}`,
+            `ui_message=${sanitizeDiagnosticValue(state?.message || diagnostic.message || '-', 220)}`,
+            `stage=${sanitizeDiagnosticValue(diagnostic.stage || '-', 48)}`,
+            `intent=${sanitizeDiagnosticValue(diagnostic.connectionIntent || '-', 24)}`,
+            `ws_target=${sanitizeDiagnosticValue(diagnostic.target || '-', 200)}`,
+            `ws_candidate=${diagnostic.candidateIndex || 1}/${diagnostic.candidateCount || 1}`,
+            `ws_opened=${diagnostic.wsOpened ? 'true' : 'false'}`,
+            `ws_stable=${diagnostic.wsStable ? 'true' : 'false'}`,
+            `ws_ready_state=${Number.isFinite(diagnostic.wsReadyState) ? diagnostic.wsReadyState : 0}`,
+            `ws_close_code=${Number.isFinite(diagnostic.wsCloseCode) ? diagnostic.wsCloseCode : 0}`,
+            `ws_close_reason=${sanitizeDiagnosticValue(diagnostic.wsCloseReason || '-', 180)}`,
+            `ticket_request_id=${sanitizeDiagnosticValue(diagnostic.ticketRequestId || '-', 128)}`,
+            `ticket_result=${sanitizeDiagnosticValue(diagnostic.ticketResult || '-', 48)}`,
+            `ticket_attempts=${Number.isFinite(diagnostic.ticketAttempts) ? diagnostic.ticketAttempts : 0}`,
+            `ticket_timeout_ms=${Number.isFinite(diagnostic.ticketTimeoutMs) ? diagnostic.ticketTimeoutMs : 0}`,
+            `ticket_expires_at=${sanitizeDiagnosticValue(diagnostic.ticketExpiresAt || '-', 48)}`,
+            `pointer_source=${sanitizeDiagnosticValue(pointerSource || '-', 48)}`,
+            `pointer_age_ms=${pointerSeenAt ? Math.max(0, Date.now() - pointerSeenAt) : -1}`,
+            `network_online=${getOnlineStateText(typeof navigator.onLine === 'boolean' ? navigator.onLine : null)}`,
+            `browser_lang=${sanitizeDiagnosticValue(navigator.language || '-', 32)}`,
+            `browser_ua=${sanitizeDiagnosticValue(navigator.userAgent || '-', 160)}`,
+            `visibility=${sanitizeDiagnosticValue(document.visibilityState || '-', 24)}`,
+            `resume_session=${shortenDiagnosticValue(diagnostic.sessionId || wsResumeId)}`,
+            `report_status=${sanitizeDiagnosticValue(diagnostic.reportStatus || 'not_sent', 48)}${diagnostic.reportRequestId ? ` (${sanitizeDiagnosticValue(diagnostic.reportRequestId, 128)})` : ''}`,
+        ].join('\n');
+    }
+
     function normalizeServerValue(url) {
         if (typeof url !== 'string') return null;
         const value = url.trim();
@@ -298,6 +708,115 @@
         return candidates.length ? candidates : [FALLBACK_WS_URL];
     }
 
+    function getCachedWsTicket() {
+        if (!wsTicketCache || !wsTicketCache.ticket) return null;
+        if ((wsTicketCache.expiresAt || 0) - Date.now() <= WS_TICKET_REFRESH_BUFFER_MS) return null;
+        return wsTicketCache.ticket;
+    }
+
+    async function requestWsTicketOnce(timeoutMs, attemptNumber) {
+        updateConnectionDiagnostic({
+            stage: 'requesting_ticket',
+            ticketResult: 'requesting',
+            ticketAttempts: attemptNumber,
+            ticketTimeoutMs: timeoutMs,
+        });
+        const controller = typeof AbortController === 'function' ? new AbortController() : null;
+        const timeoutId = controller
+            ? window.setTimeout(() => controller.abort(), timeoutMs)
+            : 0;
+        return fetch(WS_TICKET_ENDPOINT, {
+            method: 'GET',
+            cache: 'no-store',
+            credentials: 'same-origin',
+            headers: {Accept: 'application/json'},
+            signal: controller ? controller.signal : undefined,
+        }).then(async (response) => {
+            const requestId = sanitizeDiagnosticValue(response.headers.get('X-Request-ID'), 128);
+            updateConnectionDiagnostic({
+                ticketRequestId: requestId || ensureConnectionDiagnostic().ticketRequestId,
+                ticketResult: response.ok ? 'http_ok' : `http_${response.status}`,
+                ticketAttempts: attemptNumber,
+                ticketTimeoutMs: timeoutMs,
+            });
+            if (!response.ok) return null;
+            const body = await response.json();
+            const ticket = typeof body?.ticket === 'string' ? body.ticket.trim() : '';
+            const expiresAt = Date.parse(body?.expiresAt || '');
+            if (!ticket || !Number.isFinite(expiresAt)) return null;
+            wsTicketCache = {
+                ticket,
+                expiresAt,
+            };
+            updateConnectionDiagnostic({
+                stage: 'ticket_ready',
+                ticketRequestId: requestId || ensureConnectionDiagnostic().ticketRequestId,
+                ticketResult: 'ok',
+                ticketAttempts: attemptNumber,
+                ticketTimeoutMs: timeoutMs,
+                ticketExpiresAt: sanitizeDiagnosticValue(body?.expiresAt, 48),
+            });
+            return ticket;
+        }).catch((error) => {
+            Logger.warn(error);
+            updateConnectionDiagnostic({
+                ticketResult: error?.name === 'AbortError' ? 'timeout' : 'fetch_failed',
+                ticketAttempts: attemptNumber,
+                ticketTimeoutMs: timeoutMs,
+            });
+            return null;
+        }).finally(() => {
+            if (timeoutId) window.clearTimeout(timeoutId);
+        });
+    }
+
+    async function fetchWsTicket() {
+        if (!WS_TICKET_ENDPOINT || typeof fetch !== 'function') return null;
+        const cached = getCachedWsTicket();
+        if (cached) {
+            updateConnectionDiagnostic({
+                stage: 'ticket_cached',
+                ticketResult: 'cache_hit',
+                ticketExpiresAt: wsTicketCache?.expiresAt ? new Date(wsTicketCache.expiresAt).toISOString() : '',
+            });
+            return cached;
+        }
+        if (wsTicketRequest) return wsTicketRequest;
+        wsTicketRequest = (async () => {
+            for (let attempt = 0; attempt < WS_TICKET_RETRY_ATTEMPTS; attempt++) {
+                const timeoutMs = WS_TICKET_TIMEOUT_MS + attempt * 4000;
+                const ticket = await requestWsTicketOnce(timeoutMs, attempt + 1);
+                if (ticket) return ticket;
+                if (attempt < WS_TICKET_RETRY_ATTEMPTS - 1) {
+                    await new Promise((resolve) => window.setTimeout(resolve, WS_TICKET_RETRY_DELAY_MS));
+                }
+            }
+            updateConnectionDiagnostic({
+                stage: 'ticket_unavailable',
+                ticketResult: 'unavailable',
+            });
+            return null;
+        })().finally(() => {
+            wsTicketRequest = null;
+        });
+        return wsTicketRequest;
+    }
+
+    function clonePlayProfile(profile) {
+        if (!profile) return null;
+        return {
+            name: String(profile.name || ''),
+            multiSkin: String(profile.multiSkin || '').trim(),
+        };
+    }
+
+    function createPendingPlayProfile(profile) {
+        const next = clonePlayProfile(profile);
+        if (!next) return null;
+        next.sentSocketId = 0;
+        return next;
+    }
+
     function wsCleanup() {
         if (!ws) return;
         Logger.debug('WebSocket cleanup');
@@ -307,21 +826,43 @@
         ws = null;
     }
 
-    function wsInit(url) {
+    async function wsInit(url) {
         if (serverDisabled) {
             byId('connecting').hide();
             return;
         }
+        const initId = ++wsInitSequence;
         if (ws) {
             Logger.debug('WebSocket init on existing connection');
             wsCleanup();
         }
+        resetConnectingStatus();
         byId('connecting').show(0.5);
         wsUrl = url;
-        ws = new WebSocket(resolveWsUrl(url));
+        ensureConnectionDiagnostic(url, connectionDiagnosticResetPending);
+        connectionDiagnosticResetPending = false;
+        updateConnectionDiagnostic({
+            stage: 'opening_connection',
+            wsOpened: false,
+            wsStable: false,
+            wsCloseCode: 0,
+            wsCloseReason: '',
+            wsReadyState: 0,
+            final: false,
+        });
+        const ticket = await fetchWsTicket();
+        if (initId !== wsInitSequence || serverDisabled) return;
+        ws = new WebSocket(buildSocketUrl(url, ticket));
         ws._agarUrl = url;
+        ws._agarId = ++wsSocketSequence;
+        ws._agarDiagId = ensureConnectionDiagnostic(url).diagId;
         ws._agarOpened = false;
+        ws._agarStable = false;
         ws.binaryType = 'arraybuffer';
+        updateConnectionDiagnostic({
+            stage: 'socket_created',
+            wsReadyState: ws.readyState,
+        });
         ws.onopen = wsOpen;
         ws.onmessage = wsMessage;
         ws.onerror = wsError;
@@ -329,9 +870,20 @@
     }
 
     function wsOpen() {
-        if (ws) ws._agarOpened = true;
+        if (!ws) return;
+        ws._agarOpened = true;
         reconnectDelay = 1000;
-        byId('connecting').hide();
+        clearConnectionNotice();
+        updateConnectionDiagnostic({
+            stage: 'authorizing',
+            wsOpened: true,
+            wsReadyState: ws.readyState,
+        });
+        setConnectingStatus({
+            title: 'Authorizing',
+            message: 'Secure connection established. Waiting for the arena to respond...',
+        });
+        byId('connecting').show(0.5);
         wsSend(SEND_254);
         wsSend(SEND_255);
         flushPendingPlayProfile();
@@ -339,21 +891,54 @@
 
     function wsError(error) {
         Logger.warn(error);
+        updateConnectionDiagnostic({
+            stage: 'socket_error',
+            wsReadyState: ws ? ws.readyState : 0,
+        });
     }
 
     function wsClose(e) {
         if (e.currentTarget !== ws) return;
-        const failedBeforeOpen = !ws._agarOpened;
-        const disabledClose = /server disabled/i.test(e.reason || '') || serverDisabled;
+        const socketId = ws._agarId;
+        const failedBeforeStable = !ws._agarStable;
+        const hadOwnedCells = cells.mine.length > 0;
+        const closeState = describeWsClose(e, failedBeforeStable);
+        updateConnectionDiagnostic({
+            stage: closeState.terminal ? 'terminal_close' : (failedBeforeStable ? 'connect_retry' : 'reconnect_retry'),
+            severity: closeState.isError ? 'error' : 'info',
+            title: closeState.title || '',
+            message: closeState.message || '',
+            wsCloseCode: typeof e.code === 'number' ? e.code : 0,
+            wsCloseReason: sanitizeDiagnosticValue(e.reason, 180),
+            wsReadyState: typeof e.target?.readyState === 'number' ? e.target.readyState : (ws ? ws.readyState : 0),
+        });
         Logger.debug(`WebSocket disconnected ${e.code} (${e.reason})`);
+        if (failedBeforeStable) restorePendingPlayProfile(socketId);
+        cancelReconnectRecovery();
+        reconnectRecoveryAttempts = 0;
+        if (!failedBeforeStable && connectionIntent === 'play' && hadOwnedCells && reconnectRecoveryProfile) {
+            playOverlayDismissPending = true;
+        }
         wsCleanup();
         gameReset();
-        if (disabledClose) {
+        if (closeState.terminal) {
+            clearConnectionNotice();
+            resetConnectingStatus();
             byId('connecting').hide();
+            playOverlayDismissPending = false;
+            reconnectRecoveryProfile = null;
+            reconnectRecoveryAttempts = 0;
             showESCOverlay();
+            const noticeState = withDetailedConnectionNotice(closeState, true);
+            showConnectionNotice(noticeState);
+            void sendConnectionDiagnosticReport(noticeState, 'terminal_notice');
             return;
         }
-        if (failedBeforeOpen && wsCandidateIndex < wsCandidates.length - 1) {
+        void sendConnectionDiagnosticReport(closeState, failedBeforeStable ? 'connect_retry' : 'reconnect_retry');
+        clearConnectionNotice();
+        setConnectingStatus(closeState);
+        byId('connecting').show(0.5);
+        if (failedBeforeStable && wsCandidateIndex < wsCandidates.length - 1) {
             wsCandidateIndex += 1;
             setTimeout(() => wsInit(wsCandidates[wsCandidateIndex]), 250);
             return;
@@ -370,6 +955,8 @@
     }
 
     function wsMessage(data) {
+        if (data.currentTarget && data.currentTarget !== ws) return;
+        markWsStable();
         syncUpdStamp = Date.now();
         const reader = new Reader(new DataView(data.data), 0, true);
         const packetId = reader.getUint8();
@@ -468,6 +1055,7 @@
             }
             case 0x20: { // new cell
                 cells.mine.push(reader.getUint32());
+                finalizePendingSpawn();
                 break;
             }
             case 0x30: { // text list
@@ -583,6 +1171,50 @@
         writer._b.push(0, 0, 0, 0);
         wsSend(writer);
     }
+    function updatePointerPosition(clientX, clientY, source = 'pointer') {
+        if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) return false;
+        mouseX = clientX;
+        mouseY = clientY;
+        pointerSeenAt = Date.now();
+        pointerSource = source;
+        return true;
+    }
+    function updatePointerFromEvent(event, source = 'pointer') {
+        if (!event) return false;
+        return updatePointerPosition(Number(event.clientX), Number(event.clientY), source);
+    }
+    function ensurePointerPosition() {
+        if (Number.isFinite(mouseX) && Number.isFinite(mouseY)) return;
+        if (mainCanvas) {
+            updatePointerPosition(mainCanvas.width / 2, mainCanvas.height / 2, 'canvas_center');
+            return;
+        }
+        updatePointerPosition(window.innerWidth / 2, window.innerHeight / 2, 'viewport_center');
+    }
+    function getCurrentMouseTarget() {
+        ensurePointerPosition();
+        const width = mainCanvas?.width || window.innerWidth || 0;
+        const height = mainCanvas?.height || window.innerHeight || 0;
+        const scale = Number.isFinite(camera.scale) && camera.scale > 0 ? camera.scale : 1;
+        const centerX = Number.isFinite(camera.x) ? camera.x : 0;
+        const centerY = Number.isFinite(camera.y) ? camera.y : 0;
+        return {
+            x: (mouseX - width / 2) / scale + centerX,
+            y: (mouseY - height / 2) / scale + centerY,
+        };
+    }
+    function sendCurrentMouseTarget() {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+        const target = getCurrentMouseTarget();
+        if (!Number.isFinite(target.x) || !Number.isFinite(target.y)) return false;
+        sendMouseMove(Math.round(target.x), Math.round(target.y));
+        return true;
+    }
+    function scheduleMouseTargetRefresh(delay = 0) {
+        window.setTimeout(() => {
+            sendCurrentMouseTarget();
+        }, Math.max(0, delay | 0));
+    }
     function sendPlay(name) {
         const writer = new Writer(true);
         writer.setUint8(0x00);
@@ -603,29 +1235,95 @@
         wsSend(UINT8_CACHE[31]);
     }
     function queuePlayProfile() {
-        pendingPlayProfile = {
+        const nextProfile = {
             name: buildPlayName(),
             multiSkin: String(settings.multiSkin || '').trim(),
         };
-        byId('connecting').show(0.5);
+        pendingPlayProfile = createPendingPlayProfile(nextProfile);
+        reconnectRecoveryProfile = clonePlayProfile(nextProfile);
+        if (!ws || ws.readyState !== WebSocket.OPEN || !ws._agarStable) {
+            byId('connecting').show(0.5);
+        }
     }
     function flushPendingPlayProfile() {
         if (!pendingPlayProfile || !ws || ws.readyState !== WebSocket.OPEN) return false;
+        if (pendingPlayProfile.sentSocketId === ws._agarId) return true;
         sendSecondarySkin(pendingPlayProfile.multiSkin);
         sendPlay(pendingPlayProfile.name);
-        pendingPlayProfile = null;
+        sendCurrentMouseTarget();
+        pendingPlayProfile.sentSocketId = ws._agarId;
         return true;
+    }
+    function restorePendingPlayProfile(socketId) {
+        if (!pendingPlayProfile || pendingPlayProfile.sentSocketId !== socketId) return;
+        pendingPlayProfile.sentSocketId = 0;
+    }
+    function cancelReconnectRecovery() {
+        if (reconnectRecoveryTimer) {
+            window.clearTimeout(reconnectRecoveryTimer);
+            reconnectRecoveryTimer = 0;
+        }
+    }
+    function scheduleReconnectRecovery() {
+        cancelReconnectRecovery();
+        if (
+            connectionIntent !== 'play' ||
+            !reconnectRecoveryProfile ||
+            !ws ||
+            !ws._agarStable ||
+            cells.mine.length ||
+            reconnectRecoveryAttempts >= RECONNECT_RECOVERY_MAX_ATTEMPTS
+        ) return;
+        reconnectRecoveryTimer = window.setTimeout(() => {
+            reconnectRecoveryTimer = 0;
+            if (
+                connectionIntent !== 'play' ||
+                !reconnectRecoveryProfile ||
+                !ws ||
+                !ws._agarStable ||
+                cells.mine.length ||
+                reconnectRecoveryAttempts >= RECONNECT_RECOVERY_MAX_ATTEMPTS
+            ) return;
+            reconnectRecoveryAttempts += 1;
+            pendingPlayProfile = createPendingPlayProfile(reconnectRecoveryProfile);
+            setConnectingStatus({
+                title: 'Rejoining Arena',
+                message: reconnectRecoveryAttempts < RECONNECT_RECOVERY_MAX_ATTEMPTS
+                    ? 'Connection restored. Trying to spawn your cell again...'
+                    : 'Connection restored, but spawning is still delayed. Trying one last time...',
+            });
+            byId('connecting').show(0.5);
+            flushPendingPlayProfile();
+            scheduleReconnectRecovery();
+        }, RECONNECT_RECOVERY_DELAY_MS);
     }
     function sendPlayProfile() {
         if (serverDisabled) return false;
+        connectionIntent = 'play';
+        ensureConnectionDiagnostic(wsCandidates[wsCandidateIndex] || wsUrl || FALLBACK_WS_URL, !ws || ws.readyState !== WebSocket.OPEN);
+        updateConnectionDiagnostic({
+            connectionIntent: 'play',
+            stage: 'play_requested',
+            final: false,
+        });
+        playOverlayDismissPending = true;
+        cancelReconnectRecovery();
+        reconnectRecoveryAttempts = 0;
+        queuePlayProfile();
         if (!ws || ws.readyState !== WebSocket.OPEN) {
-            queuePlayProfile();
+            ensureWsConnection();
             return false;
         }
-        pendingPlayProfile = null;
-        sendSecondarySkin(settings.multiSkin);
-        sendPlay(buildPlayName());
-        return true;
+        const sent = flushPendingPlayProfile();
+        if (ws._agarStable && !cells.mine.length) {
+            setConnectingStatus({
+                title: 'Joining Arena',
+                message: 'Connected. Waiting for your cell to spawn...',
+            });
+            byId('connecting').show(0.5);
+            scheduleReconnectRecovery();
+        }
+        return sent;
     }
     function requestSoftRestart() {
         if (serverDisabled || !ws || ws.readyState !== WebSocket.OPEN) return;
@@ -727,8 +1425,24 @@
     let wsCandidates = buildServerCandidates(WEBSOCKET_URL);
     let wsCandidateIndex = 0;
     let wsUrl = wsCandidates[0];
+    const wsResumeId = getResumeSessionId();
     let ws = null;
+    let wsInitSequence = 0;
+    let wsSocketSequence = 0;
+    let wsTicketCache = null;
+    let wsTicketRequest = null;
+    let activeConnectionDiagnostic = null;
+    let activeConnectionNoticeState = null;
+    let lastConnectionReportSignature = '';
+    let bootstrapFailureHandled = false;
+    const bootstrapReportSignatures = new Set();
+    let connectionDiagnosticResetPending = true;
     let pendingPlayProfile = null;
+    let playOverlayDismissPending = false;
+    let reconnectRecoveryProfile = null;
+    let reconnectRecoveryTimer = 0;
+    let reconnectRecoveryAttempts = 0;
+    let connectionIntent = 'idle';
     let galleryTargetInputId = 'skin';
     let reconnectDelay = 1000;
     let serverDisabled = window.AGAR_CONFIG?.serverEnabled === false;
@@ -747,6 +1461,8 @@
     let dualControlActive = false;
     let mouseX = NaN;
     let mouseY = NaN;
+    let pointerSeenAt = 0;
+    let pointerSource = '';
     let macroIntervalID;
     let quadtree;
 
@@ -812,6 +1528,377 @@
         if (subtitle && message) subtitle.textContent = message;
     }
 
+    function setConnectingStatus(state) {
+        const panel = byId('connecting-content');
+        const title = byId('connecting-title');
+        const message = byId('connecting-message');
+        const details = byId('connecting-details');
+        const next = state || {};
+        if (title) title.textContent = next.title || DEFAULT_CONNECTING_TITLE;
+        if (message) message.textContent = next.message || DEFAULT_CONNECTING_MESSAGE;
+        if (details) {
+            const text = String(next.details || '').trim();
+            details.textContent = text;
+            details.hidden = !text;
+        }
+        if (panel) panel.classList.toggle('is-error', !!next.isError);
+    }
+
+    function resetConnectingStatus() {
+        setConnectingStatus();
+    }
+
+    function renderConnectionNotice(state) {
+        const notice = byId('connection-notice');
+        const title = byId('connection-notice-title');
+        const message = byId('connection-notice-message');
+        const details = byId('connection-notice-details');
+        const copyButton = byId('connection-notice-copy');
+        const hint = byId('connection-notice-hint');
+        if (!notice || !title || !message || !details) return;
+        title.textContent = state.title || 'Connection issue';
+        message.textContent = state.message || DEFAULT_CONNECTING_MESSAGE;
+        const detailText = String(state.details || '').trim();
+        details.textContent = detailText;
+        details.hidden = !detailText;
+        if (copyButton) {
+            copyButton.textContent = 'Copy diagnostic text';
+            copyButton.hidden = !detailText || !state.allowCopy;
+            copyButton.onclick = detailText ? copyConnectionNoticeDetails : null;
+        }
+        if (hint) {
+            hint.hidden = !detailText;
+            hint.textContent = detailText
+                ? 'If you contact support, send the exact diagnostic text below.'
+                : '';
+        }
+        notice.dataset.diagId = state.diagId || '';
+        notice.hidden = false;
+    }
+
+    function showConnectionNotice(state) {
+        activeConnectionNoticeState = Object.assign({}, state);
+        renderConnectionNotice(activeConnectionNoticeState);
+    }
+
+    function clearConnectionNotice() {
+        const notice = byId('connection-notice');
+        const details = byId('connection-notice-details');
+        const copyButton = byId('connection-notice-copy');
+        const hint = byId('connection-notice-hint');
+        activeConnectionNoticeState = null;
+        if (notice) {
+            notice.hidden = true;
+            notice.dataset.diagId = '';
+        }
+        if (details) {
+            details.hidden = true;
+            details.textContent = '';
+        }
+        if (copyButton) {
+            copyButton.hidden = true;
+            copyButton.textContent = 'Copy diagnostic text';
+            copyButton.onclick = null;
+        }
+        if (hint) {
+            hint.hidden = true;
+            hint.textContent = '';
+        }
+    }
+
+    function refreshVisibleConnectionNotice() {
+        if (!activeConnectionNoticeState) return;
+        activeConnectionNoticeState.details = buildConnectionSupportText(activeConnectionNoticeState);
+        renderConnectionNotice(activeConnectionNoticeState);
+    }
+
+    function copyConnectionNoticeDetails() {
+        if (!activeConnectionNoticeState?.details) return;
+        const text = activeConnectionNoticeState.details;
+        const button = byId('connection-notice-copy');
+        const restoreButtonText = () => {
+            if (button) button.textContent = 'Copy diagnostic text';
+        };
+        if (typeof navigator.clipboard?.writeText === 'function') {
+            navigator.clipboard.writeText(text).then(() => {
+                if (button) button.textContent = 'Copied';
+                window.setTimeout(restoreButtonText, 1600);
+            }).catch((error) => {
+                Logger.warn(error);
+                restoreButtonText();
+            });
+            return;
+        }
+        const fallback = document.createElement('textarea');
+        fallback.value = text;
+        fallback.setAttribute('readonly', 'readonly');
+        fallback.style.position = 'absolute';
+        fallback.style.left = '-9999px';
+        document.body.appendChild(fallback);
+        fallback.select();
+        try {
+            document.execCommand('copy');
+            if (button) button.textContent = 'Copied';
+            window.setTimeout(restoreButtonText, 1600);
+        } catch (error) {
+            Logger.warn(error);
+            restoreButtonText();
+        }
+        document.body.removeChild(fallback);
+    }
+
+    function withDetailedConnectionNotice(state, markFinal) {
+        const diagnostic = updateConnectionDiagnostic({
+            final: !!markFinal,
+            stage: markFinal ? 'terminal_notice' : (state.terminal ? 'terminal' : 'notice'),
+            severity: state.isError ? 'error' : 'info',
+            title: state.title || '',
+            message: state.message || '',
+        });
+        const baseMessage = state.message || DEFAULT_CONNECTING_MESSAGE;
+        return Object.assign({}, state, {
+            diagId: diagnostic.diagId,
+            allowCopy: true,
+            message: baseMessage.includes('Send the exact diagnostic text below')
+                ? baseMessage
+                : `${baseMessage} Send the exact diagnostic text below if you contact support.`,
+            details: buildConnectionSupportText(state),
+        });
+    }
+
+    function sendConnectionDiagnosticReport(state, stage) {
+        if (!CONNECTION_REPORT_ENDPOINT || typeof fetch !== 'function') {
+            return Promise.resolve();
+        }
+        const diagnostic = updateConnectionDiagnostic({
+            stage: sanitizeDiagnosticValue(stage || state?.stage || 'notice', 48),
+            severity: state?.isError ? 'error' : 'info',
+            title: state?.title || '',
+            message: state?.message || '',
+        });
+        const signature = [
+            diagnostic.diagId,
+            diagnostic.stage,
+            diagnostic.wsCloseCode || 0,
+            sanitizeDiagnosticValue(diagnostic.wsCloseReason, 120),
+            diagnostic.ticketResult || '-',
+        ].join('|');
+        if (lastConnectionReportSignature === signature) {
+            return Promise.resolve();
+        }
+        lastConnectionReportSignature = signature;
+        diagnostic.reportStatus = 'sending';
+        refreshVisibleConnectionNotice();
+        const network = getClientNetworkSnapshot();
+        return fetch(CONNECTION_REPORT_ENDPOINT, {
+            method: 'POST',
+            cache: 'no-store',
+            credentials: 'same-origin',
+            keepalive: true,
+            headers: {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                diagId: diagnostic.diagId,
+                reportVersion: diagnostic.reportVersion,
+                connectionIntent: diagnostic.connectionIntent,
+                stage: diagnostic.stage,
+                severity: diagnostic.severity,
+                title: diagnostic.title,
+                message: diagnostic.message,
+                detailsText: buildConnectionSupportText(state),
+                page: window.location.pathname,
+                sessionId: diagnostic.sessionId,
+                ui: {
+                    status: state?.title || diagnostic.title || '',
+                    visibleNotice: !!activeConnectionNoticeState,
+                },
+                ws: {
+                    target: diagnostic.target,
+                    candidate: diagnostic.candidate,
+                    closeCode: diagnostic.wsCloseCode,
+                    closeReason: diagnostic.wsCloseReason,
+                    opened: diagnostic.wsOpened,
+                    stable: diagnostic.wsStable,
+                    readyState: diagnostic.wsReadyState,
+                    candidateIndex: diagnostic.candidateIndex,
+                    candidateCount: diagnostic.candidateCount,
+                },
+                ticket: {
+                    requestId: diagnostic.ticketRequestId,
+                    result: diagnostic.ticketResult,
+                    attempts: diagnostic.ticketAttempts,
+                    timeoutMs: diagnostic.ticketTimeoutMs,
+                    expiresAt: diagnostic.ticketExpiresAt,
+                },
+                client: {
+                    online: typeof navigator.onLine === 'boolean' ? navigator.onLine : null,
+                    language: navigator.language || '',
+                    visibilityState: document.visibilityState || '',
+                    userAgent: navigator.userAgent || '',
+                },
+                network,
+            }),
+        }).then(async (response) => {
+            let body = null;
+            try {
+                body = await response.json();
+            } catch (error) {
+                body = null;
+            }
+            diagnostic.reportStatus = response.ok ? 'accepted' : `http_${response.status}`;
+            diagnostic.reportRequestId = sanitizeDiagnosticValue(body?.requestId, 128);
+            refreshVisibleConnectionNotice();
+        }).catch((error) => {
+            Logger.warn(error);
+            diagnostic.reportStatus = 'failed';
+            refreshVisibleConnectionNotice();
+        });
+    }
+
+    function sanitizeCloseReason(reason) {
+        return String(reason || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+    }
+
+    function formatWsCloseDetails(code, reason) {
+        const parts = [];
+        if (reason) parts.push(`Server response: ${reason}`);
+        if (code) parts.push(`WebSocket code ${code}`);
+        return parts.join(' | ');
+    }
+
+    function markWsStable() {
+        if (!ws || ws._agarStable) return;
+        ws._agarStable = true;
+        updateConnectionDiagnostic({
+            stage: 'stable',
+            wsOpened: true,
+            wsStable: true,
+            wsReadyState: ws.readyState,
+            final: false,
+        });
+        sendCurrentMouseTarget();
+        clearConnectionNotice();
+        resetConnectingStatus();
+        if (playOverlayDismissPending && !cells.mine.length) {
+            setConnectingStatus({
+                title: 'Joining Arena',
+                message: 'Connected. Waiting for your cell to spawn...',
+            });
+            byId('connecting').show(0.5);
+            scheduleReconnectRecovery();
+            return;
+        }
+        byId('connecting').hide();
+        cancelReconnectRecovery();
+    }
+
+    function finalizePendingSpawn() {
+        if (pendingPlayProfile && ws && pendingPlayProfile.sentSocketId === ws._agarId) {
+            reconnectRecoveryProfile = clonePlayProfile(pendingPlayProfile);
+            pendingPlayProfile = null;
+        }
+        updateConnectionDiagnostic({
+            stage: 'spawned',
+            final: false,
+        });
+        sendCurrentMouseTarget();
+        scheduleMouseTargetRefresh(80);
+        cancelReconnectRecovery();
+        reconnectRecoveryAttempts = 0;
+        if (!playOverlayDismissPending) return;
+        byId('connecting').hide();
+        hideESCOverlay();
+        playOverlayDismissPending = false;
+    }
+
+    function describeWsClose(event, failedBeforeStable) {
+        const code = event && typeof event.code === 'number' ? event.code : 0;
+        const reason = sanitizeCloseReason(event && event.reason);
+        const details = formatWsCloseDetails(code, reason);
+        const reasonLower = reason.toLowerCase();
+        if (serverDisabled || /server disabled/i.test(reasonLower)) {
+            return {
+                terminal: true,
+                isError: true,
+                title: 'Server Offline',
+                message: 'The arena is currently offline. Try again after the admin powers it back on.',
+                details,
+            };
+        }
+        if (reasonLower.includes('client not allowed')) {
+            return {
+                terminal: true,
+                isError: true,
+                title: 'Connection Blocked',
+                message: 'This browser or network removed a required WebSocket origin header. Disable VPN, privacy filtering, extensions, antivirus web shields, or try another browser/network.',
+                details,
+            };
+        }
+        if (reasonLower.includes('ip banned')) {
+            return {
+                terminal: true,
+                isError: true,
+                title: 'Connection Rejected',
+                message: 'This IP address is banned from the arena.',
+                details,
+            };
+        }
+        if (reasonLower.includes('ip limit reached')) {
+            return {
+                terminal: true,
+                isError: true,
+                title: 'Too Many Connections',
+                message: 'Too many arena connections are already open from this IP address.',
+                details,
+            };
+        }
+        if (reasonLower.includes('no slots')) {
+            return {
+                terminal: true,
+                isError: true,
+                title: 'Server Full',
+                message: 'The arena is full right now. Try again in a moment.',
+                details,
+            };
+        }
+        if (reasonLower.includes('not supported protocol') || code === 1002) {
+            return {
+                terminal: true,
+                isError: true,
+                title: 'Browser Unsupported',
+                message: 'This browser did not complete the game protocol correctly. Refresh the page or try a modern browser.',
+                details,
+            };
+        }
+        if (reasonLower.includes('spam') || code === 1008 || code === 1009) {
+            return {
+                terminal: true,
+                isError: true,
+                title: 'Connection Limited',
+                message: 'The server rejected this connection after invalid or excessive requests. Refresh the page and try again.',
+                details,
+            };
+        }
+        if (failedBeforeStable) {
+            return {
+                terminal: false,
+                isError: true,
+                title: 'Connecting',
+                message: 'The secure game session did not finish opening. Retrying automatically...',
+                details,
+            };
+        }
+        return {
+            terminal: false,
+            isError: true,
+            title: 'Reconnecting',
+            message: 'The connection to the arena was interrupted. Retrying automatically...',
+            details,
+        };
+    }
+
     function forgetBrokenSkin(skin) {
         if (!skin || !knownSkins.has(skin)) return;
         knownSkins.delete(skin);
@@ -832,6 +1919,8 @@
         });
     }
     refreshSkinList();
+    resetConnectingStatus();
+    clearConnectionNotice();
 
     function hideESCOverlay() {
         escOverlayShown = false;
@@ -884,12 +1973,13 @@
         }
     }
     function loadSettings() {
-        const text = localStorage.getItem('settings');
-        const obj = text ? JSON.parse(text) : settings;
+        const obj = readStoredSettings() || settings;
         for (const prop in settings) {
             const elm = byId(prop.charAt(0) === '_' ? prop.slice(1) : prop);
             if (elm) {
-                if (Object.hasOwnProperty.call(obj, prop)) settings[prop] = obj[prop];
+                if (Object.hasOwnProperty.call(obj, prop)) {
+                    settings[prop] = coerceStoredSettingValue(settings[prop], obj[prop]);
+                }
                 initSetting(prop, elm);
             } else Logger.info(`setting ${prop} not loaded because there is no element for it.`);
         }
@@ -1862,9 +2952,32 @@
         loadSettings();
         window.addEventListener('beforeunload', storeSettings);
         document.addEventListener('wheel', handleScroll, {passive: true});
-        byId('play-btn').addEventListener('click', () => {
+        const capturePointerEvent = (event, source) => {
+            if (updatePointerFromEvent(event, source) && cells.mine.length && ws && ws.readyState === WebSocket.OPEN) {
+                sendCurrentMouseTarget();
+            }
+        };
+        window.addEventListener('pointermove', (event) => {
+            updatePointerFromEvent(event, 'pointermove');
+        }, {passive: true});
+        window.addEventListener('mousemove', (event) => {
+            updatePointerFromEvent(event, 'mousemove');
+        }, {passive: true});
+        window.addEventListener('pointerdown', (event) => {
+            capturePointerEvent(event, 'pointerdown');
+        }, {passive: true});
+        window.addEventListener('mousedown', (event) => {
+            capturePointerEvent(event, 'mousedown');
+        }, {passive: true});
+        window.addEventListener('focus', () => {
+            sendCurrentMouseTarget();
+        });
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible') sendCurrentMouseTarget();
+        });
+        byId('play-btn').addEventListener('click', (event) => {
+            updatePointerFromEvent(event, 'play_click');
             sendPlayProfile();
-            hideESCOverlay();
         });
         window.onkeydown = keydown;
         window.onkeyup = keyup;
@@ -1877,19 +2990,16 @@
             drawChat();
         };
         mainCanvas.onmousemove = (event) => {
-            mouseX = event.clientX;
-            mouseY = event.clientY;
+            updatePointerFromEvent(event, 'canvas_mousemove');
         };
         setInterval(() => {
-            sendMouseMove(
-                (mouseX - mainCanvas.width / 2) / camera.scale + camera.x,
-                (mouseY - mainCanvas.height / 2) / camera.scale + camera.y
-            );
+            sendCurrentMouseTarget();
         }, 40);
         window.onresize = () => {
             const width = mainCanvas.width = window.innerWidth;
             const height = mainCanvas.height = window.innerHeight;
             camera.viewportScale = Math.max(width / 1920, height / 1080);
+            ensurePointerPosition();
         };
         window.onresize();
         const mobileStuff = byId('mobileStuff');
@@ -1903,11 +3013,13 @@
             const width = innerWidth * touchSize;
             const height = innerHeight * touchSize;
             if (touch.pageX < width && touch.pageY > innerHeight - height) {
-                mouseX = innerWidth / 2 + (touch.pageX - width / 2) * innerWidth / width;
-                mouseY = innerHeight / 2 + (touch.pageY - (innerHeight - height / 2)) * innerHeight / height;
+                updatePointerPosition(
+                    innerWidth / 2 + (touch.pageX - width / 2) * innerWidth / width,
+                    innerHeight / 2 + (touch.pageY - (innerHeight - height / 2)) * innerHeight / height,
+                    'touchpad'
+                );
             } else {
-                mouseX = touch.pageX;
-                mouseY = touch.pageY;
+                updatePointerPosition(touch.pageX, touch.pageY, 'touch');
             }
             const r = innerWidth * .02;
             touchCircle.style.left = mouseX - r + 'px';
@@ -1949,20 +3061,36 @@
             updateOfflineOverlay('The arena is currently offline. Try again after the admin powers it back on.');
         }
         drawGame();
+        if (window.__AGAR_BOOT_GUARD && typeof window.__AGAR_BOOT_GUARD.markInitDone === 'function') {
+            window.__AGAR_BOOT_GUARD.markInitDone();
+        }
         Logger.info(`Init done in ${Date.now() - LOAD_START}ms`);
     }
     window.setserver = (url) => {
         wsCandidates = buildServerCandidates(url);
         wsCandidateIndex = 0;
+        connectionDiagnosticResetPending = true;
         if (serverDisabled) {
             byId('connecting').hide();
             return;
         }
+        clearConnectionNotice();
         if (wsCandidates[0] === wsUrl && ws && ws.readyState <= WebSocket.OPEN) return;
         reconnectDelay = 1000;
         wsInit(wsCandidates[0]);
     };
     window.spectate = (/* a */) => {
+        connectionIntent = 'spectate';
+        ensureConnectionDiagnostic(wsCandidates[wsCandidateIndex] || wsUrl || FALLBACK_WS_URL, !ws || ws.readyState !== WebSocket.OPEN);
+        updateConnectionDiagnostic({
+            connectionIntent: 'spectate',
+            stage: 'spectate_requested',
+            final: false,
+        });
+        cancelReconnectRecovery();
+        playOverlayDismissPending = false;
+        pendingPlayProfile = null;
+        reconnectRecoveryAttempts = 0;
         wsSend(UINT8_CACHE[1]);
         stats.maxScore = 0;
         hideESCOverlay();
@@ -1997,17 +3125,43 @@
         setPlayButtonsDisabled(serverDisabled);
         if (serverDisabled) {
             dualControlActive = false;
+            playOverlayDismissPending = false;
+            connectionIntent = 'idle';
+            reconnectRecoveryProfile = null;
+            cancelReconnectRecovery();
+            reconnectRecoveryAttempts = 0;
             wsCleanup();
+            clearConnectionNotice();
+            resetConnectingStatus();
             byId('connecting').hide();
             showESCOverlay();
             updateOfflineOverlay(reason || 'The arena is currently offline.');
             return;
         }
         updateOfflineOverlay(window.AGAR_CONFIG?.publicSubtitle || '');
-        if (!ws) {
+        if (!ws && !activeConnectionNoticeState) {
             const selector = byId('gamemode');
             window.setserver(selector ? selector.value : (wsCandidates[0] || FALLBACK_WS_URL));
         }
     };
-    window.addEventListener('DOMContentLoaded', init);
+
+    function ensureWsConnection() {
+        if (serverDisabled) return false;
+        if (ws && ws.readyState <= WebSocket.OPEN) return true;
+        const selector = byId('gamemode');
+        const target = selector ? selector.value : (wsCandidates[0] || wsUrl || FALLBACK_WS_URL);
+        wsCandidates = buildServerCandidates(target);
+        wsCandidateIndex = 0;
+        connectionDiagnosticResetPending = true;
+        reconnectDelay = 1000;
+        wsInit(wsCandidates[0]);
+        return true;
+    }
+    window.addEventListener('DOMContentLoaded', () => {
+        try {
+            init();
+        } catch (error) {
+            handleBootstrapFailure(error, 'dom_content_loaded');
+        }
+    });
 })();

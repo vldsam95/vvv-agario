@@ -1,5 +1,5 @@
 {
-  "targetCount": 65,
+  "targetCount": 59,
   "autoFill": true,
   "profiles": [
     {
@@ -9,7 +9,7 @@
       "skin": "doge",
       "randomSkin": true,
       "spawnWeight": 3,
-      "namePrefix": "۞ẒṠ۞"
+      "namePrefix": "「彣」"
     },
     {
       "id": "hunters",
@@ -45,7 +45,7 @@
       "skin": "",
       "randomSkin": true,
       "spawnWeight": 1,
-      "namePrefix": "「彣」"
+      "namePrefix": "۞ẒṠ۞"
     }
   ]
 }

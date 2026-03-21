@@ -9,12 +9,17 @@ const sharp = require("sharp");
 
 const runtimeStore = require("./app/runtime-store");
 const RuntimeDefaults = require("../../server/MultiOgarII/src/modules/runtime");
+const WsTicket = require("../../server/MultiOgarII/src/modules/WsTicket");
+const ConnectionDiagnostics = require("../../server/MultiOgarII/src/modules/ConnectionDiagnostics");
 
 const app = express();
 const sessions = new Map();
 const ADMIN_PUBLIC_PATH = "/adminvs/";
 const LEGACY_ADMIN_PREFIX = "/admin";
 const PUBLIC_SKIN_UPLOAD_DAILY_LIMIT = 3;
+const WS_TICKET_PUBLIC_PATH = "/api/public/ws-ticket";
+const CONNECTION_REPORT_PUBLIC_PATH = "/api/public/connection-report";
+const WS_TICKET_SECRET = WsTicket.ensureSecret(runtimeStore.FILES.wsTicketSecret);
 const upload = multer({
     storage: multer.memoryStorage(),
     limits: {
@@ -40,6 +45,31 @@ app.use((req, res, next) => {
         res.setHeader("Pragma", "no-cache");
         res.setHeader("Expires", "0");
     }
+    next();
+});
+app.use((req, res, next) => {
+    req.requestId = ConnectionDiagnostics.normalizeRequestId(req.headers["x-request-id"])
+        || ConnectionDiagnostics.createId("http");
+    res.setHeader("X-Request-ID", req.requestId);
+    if (!isConnectionDiagnosticPath(req.path)) {
+        next();
+        return;
+    }
+    const startedAt = Date.now();
+    res.on("finish", () => {
+        ConnectionDiagnostics.logEvent("http_public_request", {
+            requestId: req.requestId,
+            method: req.method,
+            path: ConnectionDiagnostics.sanitizeUrl(req.originalUrl || req.url || req.path),
+            status: res.statusCode,
+            durationMs: Math.max(0, Date.now() - startedAt),
+            ip: getClientIp(req),
+            cfCountry: ConnectionDiagnostics.sanitizeText(req.headers["cf-ipcountry"], 16),
+            origin: ConnectionDiagnostics.sanitizeText(req.headers.origin, 240),
+            referer: ConnectionDiagnostics.sanitizeText(req.headers.referer, 240),
+            userAgent: ConnectionDiagnostics.sanitizeText(req.headers["user-agent"], 240),
+        });
+    });
     next();
 });
 
@@ -155,7 +185,7 @@ function verifyPassword(password, admin) {
 function createRateLimiter(windowMs, max) {
     const entries = new Map();
     return (req, res, next) => {
-        const key = req.ip || req.headers["x-forwarded-for"] || "unknown";
+        const key = getClientIp(req);
         const now = Date.now();
         const entry = entries.get(key);
         if (!entry || now - entry.windowStart > windowMs) {
@@ -209,18 +239,90 @@ function writePublicSkinQuotaState(state) {
     runtimeStore.writeJson(runtimeStore.FILES.publicSkinQuota, state);
 }
 
-function getQuotaIp(req) {
-    const forwardedFor = req.headers["x-forwarded-for"];
-    if (typeof forwardedFor === "string" && forwardedFor.trim()) {
-        const first = forwardedFor.split(",")[0].trim();
-        if (first) return first;
-    }
-    return req.ip || req.socket?.remoteAddress || "unknown";
+function getClientIp(req) {
+    return WsTicket.getClientIp(req.headers, req.ip || req.socket?.remoteAddress || "unknown");
+}
+
+function setNoStoreHeaders(res) {
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+    res.setHeader("Clear-Site-Data", "\"cache\"");
+}
+
+function isConnectionDiagnosticPath(pathname) {
+    return pathname === "/runtime-config.js"
+        || pathname === "/api/public/config"
+        || pathname === "/api/public/state"
+        || pathname === "/api/public/skins"
+        || pathname === WS_TICKET_PUBLIC_PATH
+        || pathname === CONNECTION_REPORT_PUBLIC_PATH;
+}
+
+function sanitizeBoolean(value) {
+    if (value === true || value === false) return value;
+    return undefined;
+}
+
+function sanitizePublicConnectionReport(req) {
+    const body = req.body && typeof req.body === "object" ? req.body : {};
+    const ws = body.ws && typeof body.ws === "object" ? body.ws : {};
+    const ticket = body.ticket && typeof body.ticket === "object" ? body.ticket : {};
+    const client = body.client && typeof body.client === "object" ? body.client : {};
+    const network = body.network && typeof body.network === "object" ? body.network : {};
+    return {
+        diagId: ConnectionDiagnostics.normalizeRequestId(body.diagId)
+            || ConnectionDiagnostics.createId("client"),
+        reportVersion: ConnectionDiagnostics.sanitizeText(body.reportVersion, 48),
+        connectionIntent: ConnectionDiagnostics.sanitizeText(body.connectionIntent, 24),
+        stage: ConnectionDiagnostics.sanitizeText(body.stage, 48),
+        severity: ConnectionDiagnostics.sanitizeText(body.severity, 24),
+        title: ConnectionDiagnostics.sanitizeText(body.title, 120),
+        message: ConnectionDiagnostics.sanitizeText(body.message, 240),
+        detailsText: ConnectionDiagnostics.sanitizeMultilineText(body.detailsText, 1800),
+        page: ConnectionDiagnostics.sanitizeText(body.page, 180),
+        sessionId: ConnectionDiagnostics.shortenId(body.sessionId),
+        ui: {
+            status: ConnectionDiagnostics.sanitizeText(body.ui?.status, 32),
+            visibleNotice: sanitizeBoolean(body.ui?.visibleNotice),
+        },
+        ws: {
+            target: ConnectionDiagnostics.sanitizeText(ws.target, 200),
+            candidate: ConnectionDiagnostics.sanitizeText(ws.candidate, 200),
+            closeCode: ConnectionDiagnostics.sanitizeInteger(ws.closeCode, 0, 4999),
+            closeReason: ConnectionDiagnostics.sanitizeText(ws.closeReason, 200),
+            opened: sanitizeBoolean(ws.opened),
+            stable: sanitizeBoolean(ws.stable),
+            readyState: ConnectionDiagnostics.sanitizeInteger(ws.readyState, 0, 4),
+            candidateIndex: ConnectionDiagnostics.sanitizeInteger(ws.candidateIndex, 1, 20),
+            candidateCount: ConnectionDiagnostics.sanitizeInteger(ws.candidateCount, 1, 20),
+        },
+        ticket: {
+            requestId: ConnectionDiagnostics.normalizeRequestId(ticket.requestId),
+            result: ConnectionDiagnostics.sanitizeText(ticket.result, 48),
+            attempts: ConnectionDiagnostics.sanitizeInteger(ticket.attempts, 0, 20),
+            timeoutMs: ConnectionDiagnostics.sanitizeInteger(ticket.timeoutMs, 0, 120000),
+            expiresAt: ConnectionDiagnostics.sanitizeText(ticket.expiresAt, 48),
+        },
+        client: {
+            online: sanitizeBoolean(client.online),
+            language: ConnectionDiagnostics.sanitizeText(client.language, 32),
+            visibilityState: ConnectionDiagnostics.sanitizeText(client.visibilityState, 24),
+            userAgent: ConnectionDiagnostics.sanitizeText(client.userAgent || req.headers["user-agent"], 240),
+        },
+        network: {
+            effectiveType: ConnectionDiagnostics.sanitizeText(network.effectiveType, 24),
+            rtt: ConnectionDiagnostics.sanitizeInteger(network.rtt, 0, 60000),
+            downlinkMbps: Number.isFinite(Number(network.downlinkMbps))
+                ? Math.max(0, Math.min(10000, Number(network.downlinkMbps)))
+                : undefined,
+        },
+    };
 }
 
 function getPublicSkinQuotaInfo(req, now = new Date()) {
     const state = readPublicSkinQuotaState(now);
-    const ip = getQuotaIp(req);
+    const ip = getClientIp(req);
     const count = state.entries[ip]?.count || 0;
     return {
         state,
@@ -285,6 +387,8 @@ function buildRuntimeConfig(req) {
         serverEnabled: serverSettings.serverEnabled !== false,
         serverRestartMinutes: serverSettings.serverRestart || 0,
         multiControlMaxPilots: serverSettings.multiControlMaxPilots || 2,
+        wsTicketEndpoint: WS_TICKET_PUBLIC_PATH,
+        connectionReportEndpoint: CONNECTION_REPORT_PUBLIC_PATH,
         activePresetLabel: state.presetLabel || activePreset?.label || "Arena",
         servers: buildServerOptions(serverSettings, state, activePreset),
         adminPath: ADMIN_PUBLIC_PATH,
@@ -315,6 +419,40 @@ app.get("/api/public/skins", (req, res) => {
         skins,
         total: skins.length,
         maxSkins: runtimeStore.MAX_SKINS,
+    });
+});
+
+app.get(WS_TICKET_PUBLIC_PATH, createRateLimiter(60 * 1000, 60), (req, res) => {
+    const ticket = WsTicket.issueTicket({
+        secret: WS_TICKET_SECRET,
+        ip: getClientIp(req),
+        userAgent: req.headers["user-agent"] || "",
+    });
+    ConnectionDiagnostics.logEvent("ws_ticket_issued", {
+        requestId: req.requestId,
+        ip: getClientIp(req),
+        cfCountry: ConnectionDiagnostics.sanitizeText(req.headers["cf-ipcountry"], 16),
+        userAgent: ConnectionDiagnostics.sanitizeText(req.headers["user-agent"], 240),
+        expiresAt: ticket.expiresAt,
+    });
+    res.json(ticket);
+});
+
+app.post(CONNECTION_REPORT_PUBLIC_PATH, createRateLimiter(60 * 1000, 30), (req, res) => {
+    const report = sanitizePublicConnectionReport(req);
+    ConnectionDiagnostics.logEvent("client_connection_report", {
+        requestId: req.requestId,
+        ip: getClientIp(req),
+        cfCountry: ConnectionDiagnostics.sanitizeText(req.headers["cf-ipcountry"], 16),
+        origin: ConnectionDiagnostics.sanitizeText(req.headers.origin, 240),
+        referer: ConnectionDiagnostics.sanitizeText(req.headers.referer, 240),
+        report,
+    });
+    res.json({
+        ok: true,
+        requestId: req.requestId,
+        diagId: report.diagId,
+        receivedAt: new Date().toISOString(),
     });
 });
 
@@ -494,9 +632,23 @@ app.use((req, res, next) => {
     next();
 });
 
-app.use("/adminvs", express.static(path.join(runtimeStore.WEB_DIR, "admin")));
+app.use("/adminvs", express.static(path.join(runtimeStore.WEB_DIR, "admin"), {
+    setHeaders(res, filePath) {
+        if (filePath.endsWith(".html")) setNoStoreHeaders(res);
+    },
+}));
 
-app.use(express.static(runtimeStore.WEB_DIR));
+app.use(express.static(runtimeStore.WEB_DIR, {
+    setHeaders(res, filePath) {
+        if (
+            filePath.endsWith(".html")
+            || filePath.endsWith(path.join("assets", "js", "main_out.js"))
+            || filePath.endsWith(path.join("assets", "js", "agarvvv-ui.js"))
+        ) {
+            setNoStoreHeaders(res);
+        }
+    },
+}));
 
 const port = process.env.PORT ? Number(process.env.PORT) : 3100;
 const host = process.env.HOST || "127.0.0.1";

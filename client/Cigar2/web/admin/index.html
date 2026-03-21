@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>AgarVVV Admin</title>
     <link rel="icon" type="image/png" href="/assets/img/favicon.png">
-    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet">
+    <link href="/assets/css/vendor-fonts.css" rel="stylesheet">
     <link href="/assets/css/admin.css" rel="stylesheet">
 </head>
 <body>
@@ -147,6 +147,84 @@
 
                         <div class="toolkit-callout">
                             <strong>איך לקרוא את זה:</strong> <code>Border width</code> ו־<code>Border height</code> הם גודל העולם עצמו. אם אתה מגדיל את שניהם, אתה מגדיל את שטח המפה משמעותית, ולכן בדרך כלל צריך להעלות גם <code>Food</code> ו־<code>Virus amount</code>. אם <code>Auto-fill with bots</code> מסומן, <code>Bot target</code> הוא יעד כולל של אנשים ובוטים יחד.
+                        </div>
+                    </div>
+                </section>
+
+                <section class="card">
+                    <h2>Anti-Team</h2>
+                    <p class="card-note">FFA anti-team tuned for this server: light-weight, pair-gated, and aware of multi-control + TEAM-BOTS.</p>
+                    <div class="form-grid">
+                        <label class="checkbox-row"><input id="antiTeamEnabled" type="checkbox">Enable anti-team</label>
+                        <label class="checkbox-row"><input id="antiTeamApplyToBots" type="checkbox">Apply to bots too</label>
+                        <label class="checkbox-row"><input id="antiTeamIgnoreLinkedPlayers" type="checkbox">Ignore multi-control linked players</label>
+                        <label class="checkbox-row"><input id="antiTeamIgnoreTeamBots" type="checkbox">Ignore TEAM-BOTS cooperation</label>
+                        <label>State decay / tick<input id="antiTeamStateDecayPerTick" type="number" min="0.9" max="0.99999" step="0.0001"></label>
+                        <label>Max multiplier<input id="antiTeamMaxMultiplier" type="number" min="1" max="10" step="0.1"></label>
+                        <label>Base influence<input id="antiTeamApplyBase" type="number" min="0" max="5" step="0.05"></label>
+                        <label>Decay scale<input id="antiTeamDecayScale" type="number" min="1" step="1"></label>
+                        <label>Pair window (ticks)<input id="antiTeamPairWindowTicks" type="number" min="1" step="1"></label>
+                        <label>Min pair events<input id="antiTeamMinPairEvents" type="number" min="1" max="10" step="1"></label>
+                        <label>Max tracked pairs/player<input id="antiTeamMaxPairsPerPlayer" type="number" min="1" max="128" step="1"></label>
+                        <label>Eject feed weight<input id="antiTeamEjectWeight" type="number" min="0" max="5" step="0.1"></label>
+                        <label>Player eat weight<input id="antiTeamPlayerEatWeight" type="number" min="0" max="5" step="0.05"></label>
+                        <label>Virus burst multiplier<input id="antiTeamVirusBurstMultiplier" type="number" min="1" max="5" step="0.1"></label>
+                        <label>Virus burst threshold<input id="antiTeamVirusBurstThreshold" type="number" min="1" max="10" step="0.05"></label>
+                        <label>Eject window (ticks)<input id="antiTeamEjectWindowTicks" type="number" min="1" max="250" step="1"></label>
+                    </div>
+                    <div class="anti-team-docs">
+                        <div class="toolkit-callout">
+                            <strong>איך זה עובד בקצרה:</strong> המערכת לא “מענישה על תחושה”, אלא צוברת אינטראקציות בין זוג שחקנים בתוך חלון זמן. אם יש feed או שיתוף פעולה חוזר, היא מעלה להם חשד, והעונש הוא <code>mass decay</code> מוגבר. בשרת הזה <code>1 tick = 40ms</code>, כלומר <code>25 ticks = 1 second</code>.
+                        </div>
+
+                        <div class="toolkit-block">
+                            <h3>Switches</h3>
+                            <ul class="toolkit-list">
+                                <li><strong>Enable anti-team</strong>: מדליק או מכבה את כל המנגנון.</li>
+                                <li><strong>Apply to bots too</strong>: אם מסומן, גם בוטים נבדקים ויכולים להיענש.</li>
+                                <li><strong>Ignore multi-control linked players</strong>: אם מסומן, דמויות של אותו controller לא ייחשבו teaming.</li>
+                                <li><strong>Ignore TEAM-BOTS cooperation</strong>: אם מסומן, בוטים מסוג TEAM-BOTS לא ייענשו על שיתוף הפעולה המכוון שלהם.</li>
+                            </ul>
+                        </div>
+
+                        <div class="toolkit-block">
+                            <h3>Core Sensitivity</h3>
+                            <ul class="toolkit-list">
+                                <li><strong>State decay / tick</strong>: כמה מהר החשד נעלם כל טיק. ערך קרוב יותר ל־<code>1</code> שומר חשד לזמן ארוך יותר; ערך נמוך יותר “שוכח” מהר.</li>
+                                <li><strong>Max multiplier</strong>: תקרת חומרת הענישה. גבוה יותר מאפשר decay חזק יותר.</li>
+                                <li><strong>Base influence</strong>: בסיס הלחץ שכל interaction מוסיף. גבוה יותר גורם לחשד להיבנות מהר יותר.</li>
+                                <li><strong>Decay scale</strong>: כמה חזק החשד משפיע בפועל על decay. גבוה יותר מרכך את העונש; נמוך יותר מחמיר אותו.</li>
+                            </ul>
+                        </div>
+
+                        <div class="toolkit-block">
+                            <h3>Pair Logic</h3>
+                            <ul class="toolkit-list">
+                                <li><strong>Pair window (ticks)</strong>: חלון הזמן שבו שתי אינטראקציות עדיין נחשבות אותו pair פעיל. ערך גבוה יותר מקל על תפיסת teaming מתמשך.</li>
+                                <li><strong>Min pair events</strong>: כמה אירועים צריכים להתרחש בין אותו זוג לפני שמתחילה ענישה. גבוה יותר מפחית false positives.</li>
+                                <li><strong>Max tracked pairs/player</strong>: מגבלת ביצועים. כמה זוגות נשמרים בזיכרון לכל שחקן.</li>
+                            </ul>
+                        </div>
+
+                        <div class="toolkit-block">
+                            <h3>Event Weights</h3>
+                            <ul class="toolkit-list">
+                                <li><strong>Eject feed weight</strong>: כמה חזק <code>W-feed</code> מעלה חשד. זה בדרך כלל הטריגר החזק יותר.</li>
+                                <li><strong>Player eat weight</strong>: כמה אכילת תא של שחקן אחר מעלה חשד. אם מעלים יותר מדי, גם קרבות רגילים יכולים להיראות teaming.</li>
+                                <li><strong>Eject window (ticks)</strong>: רק מסה שנאכלה מהר מספיק אחרי הירי נחשבת feed חשוד. ערך גבוה יותר סופר יותר feeds.</li>
+                            </ul>
+                        </div>
+
+                        <div class="toolkit-block">
+                            <h3>Virus Escalation</h3>
+                            <ul class="toolkit-list">
+                                <li><strong>Virus burst multiplier</strong>: אם שחקן כבר חשוד מספיק ואוכל וירוס, זה מכפיל את מצב החשד שלו.</li>
+                                <li><strong>Virus burst threshold</strong>: מאיזו רמת חשד בכלל מפעילים את החמרת הווירוס. ערך נמוך יותר מפעיל החמרה מוקדם יותר.</li>
+                            </ul>
+                        </div>
+
+                        <div class="toolkit-callout">
+                            <strong>כלל אצבע:</strong> אם אתה רוצה מערכת עדינה, העלה <code>Min pair events</code>, הורד <code>Player eat weight</code>, והשאר <code>Ignore multi-control linked players</code> ו־<code>Ignore TEAM-BOTS cooperation</code> דלוקים. אם אתה רוצה מערכת קשוחה יותר, העלה <code>Eject feed weight</code>, הגדל <code>Pair window</code>, וקירב את <code>State decay / tick</code> ל־<code>1</code>.
                         </div>
                     </div>
                 </section>

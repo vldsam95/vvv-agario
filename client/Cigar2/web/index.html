@@ -14,15 +14,177 @@
     <title>AgarVVV Arena</title>
 
     <link id="favicon" rel="icon" type="image/png" href="assets/img/favicon.png">
-    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet" type="text/css">
-    <link href="https://maxcdn.bootstrapcdn.com/bootstrap/3.3.4/css/bootstrap.min.css" rel="stylesheet">
+    <link href="assets/css/vendor-fonts.css" rel="stylesheet">
+    <link href="assets/vendor/bootstrap/css/bootstrap.min.css" rel="stylesheet">
     <link href="assets/css/index.css" rel="stylesheet">
     <link href="assets/css/gallery.css" rel="stylesheet">
     <link href="assets/css/agarvvv.css" rel="stylesheet">
 
     <script src="assets/js/quadtree.js"></script>
     <script src="/runtime-config.js"></script>
-    <script src="assets/js/main_out.js?v=20260312-skinslots"></script>
+    <script>
+        (function() {
+            var reportEndpoint = "/api/public/connection-report";
+            var reportVersion = "2026-03-loader-guard-v1";
+            var diagId = "diag-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+            var reportSent = {};
+            var timeoutId = 0;
+
+            function sanitize(value, maxLength) {
+                return String(value || "").replace(/\s+/g, " ").trim().slice(0, maxLength || 200);
+            }
+
+            function buildDetails(stage, title, message, extra) {
+                var lines = [
+                    "diag_id=" + sanitize(diagId, 64),
+                    "time_utc=" + new Date().toISOString(),
+                    "stage=" + sanitize(stage, 48),
+                    "title=" + sanitize(title, 120),
+                    "message=" + sanitize(message, 220),
+                    "page=" + sanitize(window.location.pathname || "/", 180),
+                    "browser_lang=" + sanitize(navigator.language || "-", 32),
+                    "browser_ua=" + sanitize(navigator.userAgent || "-", 180)
+                ];
+                if (extra) lines.push("details=" + sanitize(extra, 400));
+                return lines.join("\n");
+            }
+
+            function ensureUi(title, message, details) {
+                var apply = function() {
+                    var overlays = document.getElementById("overlays");
+                    var notice = document.getElementById("connection-notice");
+                    var noticeTitle = document.getElementById("connection-notice-title");
+                    var noticeMessage = document.getElementById("connection-notice-message");
+                    var noticeDetails = document.getElementById("connection-notice-details");
+                    var noticeHint = document.getElementById("connection-notice-hint");
+                    var copyButton = document.getElementById("connection-notice-copy");
+                    var connecting = document.getElementById("connecting");
+                    var badge = document.getElementById("server-status-badge");
+                    if (overlays) {
+                        overlays.style.display = "";
+                        overlays.style.opacity = 1;
+                    }
+                    if (connecting) connecting.style.display = "none";
+                    if (badge) badge.textContent = "Error";
+                    if (noticeTitle) noticeTitle.textContent = title;
+                    if (noticeMessage) noticeMessage.textContent = message;
+                    if (noticeDetails) {
+                        noticeDetails.hidden = !details;
+                        noticeDetails.textContent = details || "";
+                    }
+                    if (noticeHint) {
+                        noticeHint.hidden = !details;
+                        noticeHint.textContent = details ? "If this keeps happening, send the diagnostic text below." : "";
+                    }
+                    if (copyButton) {
+                        copyButton.hidden = !details;
+                        copyButton.textContent = "Copy diagnostic text";
+                        copyButton.onclick = !details ? null : function() {
+                            if (navigator.clipboard && navigator.clipboard.writeText) {
+                                navigator.clipboard.writeText(details).then(function() {
+                                    copyButton.textContent = "Copied";
+                                    setTimeout(function() {
+                                        copyButton.textContent = "Copy diagnostic text";
+                                    }, 1600);
+                                });
+                            }
+                        };
+                    }
+                    if (notice) notice.hidden = false;
+                };
+                if (document.readyState === "loading") {
+                    document.addEventListener("DOMContentLoaded", apply, { once: true });
+                    return;
+                }
+                apply();
+            }
+
+            function send(stage, title, message, extra) {
+                if (reportSent[stage]) return;
+                reportSent[stage] = true;
+                var detailsText = buildDetails(stage, title, message, extra);
+                fetch(reportEndpoint, {
+                    method: "POST",
+                    cache: "no-store",
+                    credentials: "same-origin",
+                    keepalive: true,
+                    headers: {
+                        "Accept": "application/json",
+                        "Content-Type": "application/json"
+                    },
+                    body: JSON.stringify({
+                        diagId: diagId,
+                        reportVersion: reportVersion,
+                        connectionIntent: "bootstrap",
+                        stage: stage,
+                        severity: "error",
+                        title: title,
+                        message: message,
+                        detailsText: detailsText,
+                        page: window.location.pathname,
+                        sessionId: "",
+                        ui: {
+                            status: title,
+                            visibleNotice: true
+                        },
+                        ws: {
+                            target: "",
+                            candidate: "",
+                            closeCode: 0,
+                            closeReason: "",
+                            opened: false,
+                            stable: false,
+                            readyState: 0,
+                            candidateIndex: 1,
+                            candidateCount: 1
+                        },
+                        ticket: {
+                            requestId: "",
+                            result: stage,
+                            attempts: 0,
+                            timeoutMs: 0,
+                            expiresAt: ""
+                        },
+                        client: {
+                            online: typeof navigator.onLine === "boolean" ? navigator.onLine : null,
+                            language: navigator.language || "",
+                            visibilityState: document.visibilityState || "",
+                            userAgent: navigator.userAgent || ""
+                        },
+                        network: {}
+                    })
+                }).catch(function() {});
+                ensureUi(title, message, detailsText);
+            }
+
+            window.__AGAR_BOOT_GUARD = {
+                markMainLoaded: function() {
+                    window.__AGAR_MAIN_SCRIPT_LOADED = true;
+                },
+                markMainFailed: function() {
+                    send("main_script_load_error", "Client script failed to load", "The main game client did not load. Hard refresh the page with Ctrl+F5 and try again.");
+                },
+                markInitDone: function() {
+                    window.__AGAR_MAIN_BOOT_OK = true;
+                    if (timeoutId) clearTimeout(timeoutId);
+                },
+                armTimeout: function() {
+                    if (timeoutId) clearTimeout(timeoutId);
+                    timeoutId = window.setTimeout(function() {
+                        if (window.__AGAR_MAIN_BOOT_OK) return;
+                        send(
+                            window.__AGAR_MAIN_SCRIPT_LOADED ? "main_boot_timeout" : "main_script_missing",
+                            "Client startup stalled",
+                            "The main game client did not finish loading. Hard refresh the page with Ctrl+F5 and try again."
+                        );
+                    }, 5000);
+                }
+            };
+
+            window.__AGAR_BOOT_GUARD.armTimeout();
+        })();
+    </script>
+    <script src="assets/js/main_out.js?v=20260321-loaderguard2" onload="window.__AGAR_BOOT_GUARD && window.__AGAR_BOOT_GUARD.markMainLoaded()" onerror="window.__AGAR_BOOT_GUARD && window.__AGAR_BOOT_GUARD.markMainFailed()"></script>
     <script defer src="assets/js/agarvvv-ui.js?v=20260312-skinslots"></script>
 </head>
 
@@ -46,6 +208,13 @@
                     <div class="panel-heading-line">
                         <span>Enter Arena</span>
                         <span id="server-status-badge" class="status-badge">Syncing...</span>
+                    </div>
+                    <div id="connection-notice" class="connection-notice" hidden>
+                        <strong id="connection-notice-title">Connection issue</strong>
+                        <p id="connection-notice-message"></p>
+                        <p id="connection-notice-hint" class="connection-notice-hint" hidden></p>
+                        <code id="connection-notice-details" hidden></code>
+                        <button id="connection-notice-copy" class="connection-notice-copy" type="button" hidden>Copy diagnostic text</button>
                     </div>
                     <div class="form-group arena-fields">
                         <input id="nick" class="form-control" placeholder="Nickname" maxlength="15">
@@ -191,8 +360,9 @@
 
     <div id="connecting">
         <div id="connecting-content">
-            <h2>Connecting</h2>
-            <p> If you cannot connect to the servers, check if you have some anti virus or firewall blocking the connection.</p>
+            <h2 id="connecting-title">Connecting</h2>
+            <p id="connecting-message">Establishing a secure connection to the arena.</p>
+            <p id="connecting-details" class="connecting-details" hidden></p>
         </div>
     </div>
 

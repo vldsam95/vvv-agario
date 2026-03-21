@@ -89,6 +89,13 @@ class Client {
             this.server.sendChatMessage(null, this.socket.player, "This server's chat is disabled.");
         if (this.protocol < 4)
             this.server.sendChatMessage(null, this.socket.player, `WARNING: Protocol ${this.protocol} assumed as 4!`);
+        if (this.socket._agarResumed && typeof this.socket.player.refreshOwnedCells === "function") {
+            this.socket.player.clientNodes = [];
+            this.socket.player.multiControl.pendingOwnedRefresh = true;
+            this.socket.player.refreshOwnedCells();
+            this.server.sendChatMessage(null, this.socket.player, "Connection restored.");
+            this.socket._agarResumed = false;
+        }
     }
     message_onJoin(message) {
         const tick = this.server.ticks;

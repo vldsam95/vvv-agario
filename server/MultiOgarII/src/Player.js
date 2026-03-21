@@ -72,6 +72,7 @@ class Player {
             this.pID = server.lastPlayerId++ >> 0;
             // Gamemode function
             server.mode.onPlayerInit(this);
+            server.antiTeam?.initPlayer(this);
             // Only scramble if enabled in config
             this.scramble();
         }
@@ -134,6 +135,7 @@ class Player {
         if (!name) name = "";
         this.setName(name);
         this.resetMultiControlState();
+        this.server.antiTeam?.resetPlayer(this);
         this.spectate = false;
         this.freeRoam = false;
         this.spectateTarget = null;
@@ -479,7 +481,10 @@ class Player {
             // Wait for playerDisconnectTime
             var pt = this.server.config.playerDisconnectTime;
             var dt = (this.server.stepDateTime - this.socket.closeTime) / 1e3;
-            const disconnectGrace = pt > 0 ? pt : 0;
+            const resumeGrace = this.socket.resumeId
+                ? Math.max(0, Number(this.server.config.serverResumeGrace) || 0)
+                : 0;
+            const disconnectGrace = pt > 0 ? Math.max(pt, resumeGrace) : resumeGrace;
             const shouldRemoveLinkedCells = !this.hasAnyLinkedCells() || dt >= disconnectGrace;
             if (shouldRemoveLinkedCells) {
                 for (const player of this.getLinkedPlayers()) {

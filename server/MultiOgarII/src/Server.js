@@ -9,8 +9,11 @@ const WebSocket = require("ws");
 const Entity = require('./entity');
 const Vec2 = require('./modules/Vec2.js');
 const Logger = require('./modules/Logger.js');
+const ConnectionDiagnostics = require('./modules/ConnectionDiagnostics');
 const {QuadNode, Quad} = require('./modules/QuadNode.js');
 const Runtime = require('./modules/runtime');
+const AntiTeam = require('./modules/AntiTeam');
+const WsTicket = require('./modules/WsTicket');
 const Player = require('./Player');
 const Client = require('./Client');
 const PlayerCommand = require('./modules/PlayerCommand');
@@ -18,6 +21,35 @@ const BotLoader = require('./ai/BotLoader');
 const Gamemode = require('./gamemodes');
 const Packet = require('./packet');
 const UserRoleEnum = require('./enum/UserRoleEnum');
+
+const RESUME_ID_PATTERN = /^[a-z0-9]{24,64}$/i;
+const WS_HEARTBEAT_INTERVAL_MS = 25000;
+const WS_HEARTBEAT_TIMEOUT_MS = 65000;
+
+function sanitizeResumeId(value) {
+    if (typeof value !== "string") return "";
+    const text = value.trim();
+    return RESUME_ID_PATTERN.test(text) ? text : "";
+}
+
+function buildWsDiagnosticBase(ws) {
+    return {
+        requestId: ws?.diagRequestId || "",
+        connectionId: ws?.diagConnectionId || "",
+        ip: ws?.remoteAddress || ws?.diagClientIp || "",
+        remotePort: ws?.remotePort || ws?._socket?.remotePort || 0,
+        origin: ws?.diagOrigin || "",
+        requestUrl: ws?.diagRequestUrl || "",
+        resumeId: ws?.diagResumeId || "",
+        ticketMode: ws?.diagTicketMode || "unknown",
+        originAllowed: ws?.diagOriginAllowed,
+        userAgent: ws?.diagUserAgent || "",
+    };
+}
+
+function logWsEvent(type, ws, extra = {}) {
+    ConnectionDiagnostics.logEvent(type, Object.assign(buildWsDiagnosticBase(ws), extra));
+}
 
 // Server implementation
 class Server {
@@ -32,6 +64,7 @@ class Server {
         this.lastNodeId = 1;
         this.lastPlayerId = 1;
         this.clients = [];
+        this.resumeSockets = new Map();
         this.socketCount = 0;
         this.largestClient = null; // Required for spectators
         this.nodes = []; // Total nodes
@@ -54,6 +87,7 @@ class Server {
         this.mainLoopBind = null;
         this.ticks = 0;
         this.disableSpawn = this.config?.serverEnabled === false;
+        this.heartbeatLoopId = 0;
 
         // Config
         this.runtime = Runtime.loadRuntimeSnapshot();
@@ -61,6 +95,8 @@ class Server {
         this.botSettings = this.runtime.botSettings;
         this.modePresets = this.runtime.modePresets;
         this.selectedPresetKey = this.runtime.selectedPresetKey;
+        this.antiTeam = new AntiTeam(this);
+        this.wsTicketSecret = WsTicket.ensureSecret(Runtime.RUNTIME_FILES.wsTicketSecret);
         this.runtimeMtime = {
             serverSettings: Runtime.getMtime(this.runtime.files.serverSettings),
             modePresets: Runtime.getMtime(this.runtime.files.modePresets),
@@ -118,6 +154,7 @@ class Server {
         }
     }
     onHttpServerOpen() {
+        this.startHeartbeatLoop();
         // Start Main Loop
         setTimeout(this.timerLoopBind, 1);
         // Done
@@ -156,53 +193,80 @@ class Server {
         }
         process.exit(1); // Exits the program
     }
-    onClientSocketOpen(ws, req) {
-        var req = req || ws.upgradeReq;
-        var logip = ws._socket.remoteAddress + ":" + ws._socket.remotePort;
-        ws.on('error', function (err) {
-            Logger.writeError("[" + logip + "] " + err.stack);
-        });
-        if (this.config.serverEnabled === false) {
-            ws.close(1001, "Server disabled");
-            return;
+    findResumableSocket(resumeId, clientIp, userAgent) {
+        if (!resumeId) return null;
+        const userAgentHash = WsTicket.hashUserAgent(userAgent || "");
+        const now = Date.now();
+        const candidates = [];
+        const mapped = this.resumeSockets.get(resumeId);
+        if (mapped) candidates.push(mapped);
+        for (const socket of this.clients) {
+            if (socket && socket !== mapped) candidates.push(socket);
         }
-        if (this.config.serverMaxConnections && this.socketCount >= this.config.serverMaxConnections) {
-            ws.close(1000, "No slots");
-            return;
+        for (const socket of candidates) {
+            if (!socket || !socket.player || socket.player.isRemoved) continue;
+            if (socket.resumeId !== resumeId) continue;
+            if (socket.remoteAddress !== clientIp) continue;
+            if (socket.resumeUserAgentHash && socket.resumeUserAgentHash !== userAgentHash) continue;
+            const transportClosed = socket.isConnected === false ||
+                socket.readyState !== WebSocket.OPEN ||
+                socket._socket?.destroyed === true;
+            const staleActiveSocket = socket.isConnected && (now - (socket.lastAliveTime || 0)) > 500;
+            if (!transportClosed && !staleActiveSocket) continue;
+            return socket;
         }
-        if (this.checkIpBan(ws._socket.remoteAddress)) {
-            ws.close(1000, "IP banned");
-            return;
-        }
-        if (this.config.serverIpLimit) {
-            var ipConnections = 0;
-            for (var i = 0; i < this.clients.length; i++) {
-                var socket = this.clients[i];
-                if (!socket.isConnected || socket.remoteAddress != ws._socket.remoteAddress)
-                    continue;
-                ipConnections++;
-            }
-            if (ipConnections >= this.config.serverIpLimit) {
-                ws.close(1000, "IP limit reached");
-                return;
-            }
-        }
-        const origin = (req.headers.origin || "").trim();
-        if (this.clientBind.length && !this.clientBind.some((allowedOrigin) => origin.indexOf(allowedOrigin) === 0)) {
-            ws.close(1000, "Client not allowed");
-            return;
-        }
+        return null;
+    }
+    initializeLiveSocket(ws, clientIp, userAgent, resumeId) {
         ws.isConnected = true;
-        ws.remoteAddress = ws._socket.remoteAddress;
+        ws.remoteAddress = clientIp;
         ws.remotePort = ws._socket.remotePort;
         ws.lastAliveTime = Date.now();
-        Logger.write("CONNECTED " + ws.remoteAddress + ":" + ws.remotePort + ", origin: \"" + origin + "\"");
-        ws.player = new Player(this, ws);
-        ws.client = new Client(this, ws);
-        ws.playerCommand = new PlayerCommand(this, ws.player);
+        ws.diagLastPongAt = ws.lastAliveTime;
+        ws.diagLastPingAt = 0;
+        ws.diagHeartbeatTimedOut = false;
+        ws.resumeId = resumeId || "";
+        ws.resumeUserAgentHash = WsTicket.hashUserAgent(userAgent || "");
+        if (ws.resumeId) this.resumeSockets.set(ws.resumeId, ws);
+    }
+    startHeartbeatLoop() {
+        if (this.heartbeatLoopId) return;
+        this.heartbeatLoopId = setInterval(() => {
+            this.runHeartbeatSweep();
+        }, WS_HEARTBEAT_INTERVAL_MS);
+    }
+    runHeartbeatSweep() {
+        const now = Date.now();
+        for (const ws of this.clients) {
+            if (!ws || ws.isConnected === false) continue;
+            if (ws.readyState !== WebSocket.OPEN) continue;
+            const lastSeenAt = Math.max(ws.lastAliveTime || 0, ws.diagLastPongAt || 0, ws.diagConnectedAt || 0);
+            if ((now - lastSeenAt) > WS_HEARTBEAT_TIMEOUT_MS) {
+                ws.diagHeartbeatTimedOut = true;
+                ws._closeCode = 1006;
+                ws._closeMessage = "Heartbeat timeout";
+                logWsEvent("ws_heartbeat_timeout", ws, {
+                    lastSeenAgoMs: Math.max(0, now - lastSeenAt),
+                    lastPongAgoMs: Math.max(0, now - (ws.diagLastPongAt || ws.diagConnectedAt || now)),
+                    lastMessageAgoMs: Math.max(0, now - (ws.lastAliveTime || ws.diagConnectedAt || now)),
+                    heartbeatIntervalMs: WS_HEARTBEAT_INTERVAL_MS,
+                    heartbeatTimeoutMs: WS_HEARTBEAT_TIMEOUT_MS,
+                });
+                if (typeof ws.terminate === "function") ws.terminate();
+                else ws.close(1001, "Heartbeat timeout");
+                continue;
+            }
+            ws.diagLastPingAt = now;
+            try {
+                ws.ping();
+            } catch (error) {
+                Logger.writeError(`[${ws.remoteAddress}:${ws.remotePort}] heartbeat ping failed: ${error.message}`);
+            }
+        }
+    }
+    bindClientSocket(ws, logip) {
         ws.on('message', message => {
             if (this.config.serverWsModule === "uws")
-                // uws gives ArrayBuffer - convert it to Buffer
                 message = Buffer.from(message);
             if (!message.length) return;
             if (message.length > 256) {
@@ -211,26 +275,179 @@ class Server {
             }
             ws.client.handleMessage(message);
         });
+        ws.on('pong', () => {
+            ws.diagLastPongAt = Date.now();
+            ws.diagHeartbeatTimedOut = false;
+        });
         ws.on('error', function (error) {
             ws.client.sendPacket = function (data) { };
         });
-        ws.on('close', reason => {
+        ws.on('close', (code, reason) => {
             if (ws._socket && ws._socket.destroy != null && typeof ws._socket.destroy == 'function') {
                 ws._socket.destroy();
             }
             this.socketCount = Math.max(0, this.socketCount - 1);
             ws.isConnected = false;
             ws.client.sendPacket = () => {};
+            const closeCode = Number.isFinite(ws._closeCode) ? ws._closeCode : code;
+            const closeMessage = ConnectionDiagnostics.sanitizeText(
+                Buffer.isBuffer(reason) ? reason.toString("utf8") : (ws._closeMessage || reason || ""),
+                200
+            );
             ws.closeReason = {
-                reason: ws._closeCode,
-                message: ws._closeMessage
+                reason: closeCode,
+                message: closeMessage
             };
             ws.closeTime = Date.now();
-            Logger.write("DISCONNECTED " + ws.remoteAddress + ":" + ws.remotePort + ", code: " + ws._closeCode +
-                ", reason: \"" + ws._closeMessage + "\", name: \"" + ws.player._name + "\"");
+            logWsEvent("ws_disconnected", ws, {
+                closeCode,
+                closeMessage,
+                playerName: ConnectionDiagnostics.sanitizeText(ws.player?._name, 64),
+                sessionMs: ws.diagConnectedAt ? Math.max(0, Date.now() - ws.diagConnectedAt) : undefined,
+                resumed: ws.diagResumed === true,
+                heartbeatTimedOut: ws.diagHeartbeatTimedOut === true,
+                lastPongAgoMs: ws.diagLastPongAt ? Math.max(0, Date.now() - ws.diagLastPongAt) : undefined,
+                lastMessageAgoMs: ws.lastAliveTime ? Math.max(0, Date.now() - ws.lastAliveTime) : undefined,
+            });
+            Logger.write("DISCONNECTED " + ws.remoteAddress + ":" + ws.remotePort + ", code: " + closeCode +
+                ", reason: \"" + closeMessage + "\", name: \"" + ws.player._name + "\"");
         });
+    }
+    restoreConnection(ws, previousSocket, clientIp, origin, resumeId, userAgent) {
+        const player = previousSocket?.player;
+        if (!player) return false;
+        const linkedPlayers = typeof player.getLinkedPlayers === "function"
+            ? player.getLinkedPlayers()
+            : [player];
+        this.initializeLiveSocket(ws, clientIp, userAgent, resumeId);
+        ws.player = player;
+        ws.client = new Client(this, ws);
+        ws.playerCommand = new PlayerCommand(this, player);
+        ws._agarResumed = true;
+        player.socket = ws;
+        player.isRemoved = false;
+        player.isCloseRequested = false;
+        player.mouse = player.mouse || new Vec2(0, 0);
+        player.inputMouse = player.inputMouse || new Vec2(0, 0);
+        for (const linked of linkedPlayers) {
+            if (!linked) continue;
+            linked.clientNodes = [];
+            if (linked !== player) linked.isRemoved = false;
+        }
+        player.multiControl.pendingOwnedRefresh = true;
+        player.scramble();
+        const index = this.clients.indexOf(previousSocket);
+        if (index >= 0) this.clients[index] = ws;
+        else this.clients.push(ws);
+        if (resumeId) this.resumeSockets.set(resumeId, ws);
+        ws.diagResumed = true;
+        logWsEvent("ws_resumed", ws, {
+            resumedFromConnectionId: previousSocket?.diagConnectionId || "",
+            playerName: ConnectionDiagnostics.sanitizeText(player._name, 64),
+        });
+        Logger.info("RESUMED " + ws.remoteAddress + ":" + ws.remotePort + ", origin: \"" + origin + "\", name: \"" + player._name + "\"");
+        return true;
+    }
+    onClientSocketOpen(ws, req) {
+        var req = req || ws.upgradeReq;
+        const clientIp = WsTicket.getClientIp(req.headers, ws._socket.remoteAddress);
+        const userAgent = req.headers["user-agent"] || "";
+        const origin = ConnectionDiagnostics.sanitizeText(req.headers.origin, 240);
+        const requestUrl = new URL(req.url || "/", "ws://localhost");
+        const resumeId = sanitizeResumeId(requestUrl.searchParams.get("resume_id"));
+        ws.diagRequestId = ConnectionDiagnostics.normalizeRequestId(req.headers["x-request-id"])
+            || ConnectionDiagnostics.createId("ws");
+        ws.diagConnectionId = ConnectionDiagnostics.createId("wsconn");
+        ws.diagClientIp = clientIp;
+        ws.diagUserAgent = ConnectionDiagnostics.sanitizeText(userAgent, 240);
+        ws.diagOrigin = origin;
+        ws.diagRequestUrl = ConnectionDiagnostics.sanitizeUrl(req.url || "/");
+        ws.diagResumeId = ConnectionDiagnostics.shortenId(resumeId);
+        ws.diagConnectedAt = Date.now();
+        var logip = clientIp + ":" + ws._socket.remotePort;
+        ws.on('error', function (err) {
+            Logger.writeError("[" + logip + "] " + err.stack);
+        });
+        logWsEvent("ws_handshake_received", ws, {
+            cfCountry: ConnectionDiagnostics.sanitizeText(req.headers["cf-ipcountry"], 16),
+        });
+        if (this.config.serverEnabled === false) {
+            logWsEvent("ws_rejected", ws, {reason: "server_disabled"});
+            ws.close(1001, "Server disabled");
+            return;
+        }
+        if (this.config.serverMaxConnections && this.socketCount >= this.config.serverMaxConnections) {
+            logWsEvent("ws_rejected", ws, {reason: "server_full"});
+            ws.close(1000, "No slots");
+            return;
+        }
+        if (this.checkIpBan(clientIp)) {
+            logWsEvent("ws_rejected", ws, {reason: "ip_banned"});
+            ws.close(1000, "IP banned");
+            return;
+        }
+        if (this.config.serverIpLimit) {
+            var ipConnections = 0;
+            for (var i = 0; i < this.clients.length; i++) {
+                var socket = this.clients[i];
+                if (!socket.isConnected || socket.remoteAddress != clientIp)
+                    continue;
+                ipConnections++;
+            }
+            if (ipConnections >= this.config.serverIpLimit) {
+                logWsEvent("ws_rejected", ws, {reason: "ip_limit_reached", ipConnections});
+                ws.close(1000, "IP limit reached");
+                return;
+            }
+        }
+        const originAllowed = !this.clientBind.length || this.clientBind.some((allowedOrigin) => origin.indexOf(allowedOrigin) === 0);
+        const strictTicket = WsTicket.verifyTicket({
+            secret: this.wsTicketSecret,
+            ticket: requestUrl.searchParams.get("ws_ticket"),
+            ip: clientIp,
+            userAgent,
+        });
+        const relaxedTicket = !strictTicket && WsTicket.verifyTicket({
+            secret: this.wsTicketSecret,
+            ticket: requestUrl.searchParams.get("ws_ticket"),
+            ip: clientIp,
+            userAgent,
+            allowIpMismatch: true,
+        });
+        const ticketMode = strictTicket ? "strict" : (relaxedTicket ? "relaxed-ip" : "none");
+        ws.diagTicketMode = ticketMode;
+        ws.diagOriginAllowed = originAllowed;
+        if (!originAllowed && ticketMode === "none") {
+            logWsEvent("ws_rejected", ws, {reason: "client_not_allowed"});
+            Logger.info(`REJECTED ${clientIp}:${ws._socket.remotePort}, origin: "${origin}", reason: "Client not allowed"`);
+            ws.close(1000, "Client not allowed");
+            return;
+        }
+        const resumableSocket = this.findResumableSocket(resumeId, clientIp, userAgent);
+        if (resumeId) {
+            logWsEvent("ws_resume_lookup", ws, {match: !!resumableSocket});
+            Logger.info(`RESUME LOOKUP ${clientIp}:${ws._socket.remotePort}, id: "${resumeId}", match: ${resumableSocket ? "yes" : "no"}`);
+        }
+        const resumed = this.restoreConnection(ws, resumableSocket, clientIp, origin, resumeId, userAgent);
+        if (!resumed) {
+            this.initializeLiveSocket(ws, clientIp, userAgent, resumeId);
+            Logger.info("CONNECTED " + ws.remoteAddress + ":" + ws.remotePort + ", origin: \"" + origin + "\"" +
+                (ticketMode === "strict" && !originAllowed
+                    ? ", ticket: fallback"
+                    : ticketMode === "relaxed-ip"
+                        ? ", ticket: relaxed-ip-fallback"
+                        : ""));
+            ws.player = new Player(this, ws);
+            ws.client = new Client(this, ws);
+            ws.playerCommand = new PlayerCommand(this, ws.player);
+            this.clients.push(ws);
+            logWsEvent("ws_connected", ws, {
+                playerName: ConnectionDiagnostics.sanitizeText(ws.player?._name, 64),
+                ticketFallback: !originAllowed && ticketMode !== "none",
+            });
+        }
+        this.bindClientSocket(ws, logip);
         this.socketCount++;
-        this.clients.push(ws);
         // Check for external minions
         this.checkMinion(ws, req);
     }
@@ -575,6 +792,26 @@ class Server {
             },
         });
     }
+    updateAntiTeam() {
+        if (!this.antiTeam) return;
+        const processed = new Set();
+        for (const socket of this.clients) {
+            const player = socket?.player;
+            if (!player) continue;
+            const controller = typeof player.getLinkedController === "function"
+                ? player.getLinkedController()
+                : player;
+            if (!controller) continue;
+            const linkedPlayers = typeof controller.getLinkedPlayers === "function"
+                ? controller.getLinkedPlayers()
+                : [controller];
+            for (const linked of linkedPlayers) {
+                if (!linked || processed.has(linked)) continue;
+                processed.add(linked);
+                this.antiTeam.tickPlayer(linked);
+            }
+        }
+    }
     resetWorld(reason = "Server configuration refreshed") {
         if (this.config.serverEnabled === false) {
             this.shutdownWorld(reason);
@@ -611,6 +848,7 @@ class Server {
             player.spectate = false;
             player.freeRoam = false;
             player.resetMultiControlState();
+            this.antiTeam?.resetPlayer(player);
             player.scramble();
             socket.client.sendPacket(new Packet.ClearAll());
             socket.client.sendPacket(new Packet.SetBorder(player, this.border, this.config.serverGamemode, "MultiOgarII " + this.version));
@@ -638,6 +876,9 @@ class Server {
             client.player.checkConnection();
             // remove dead client
             if (client.player.isRemoved || client.isCloseRequest) {
+                if (client.resumeId && this.resumeSockets.get(client.resumeId) === client) {
+                    this.resumeSockets.delete(client.resumeId);
+                }
                 this.clients.removeUnsorted(null, i);
                 --i;
             }
@@ -814,6 +1055,7 @@ class Server {
             }
             for (const m of eatCollisions) this.resolveCollision(m);
             this.mode.onTick(this);
+            this.updateAntiTeam();
             this.ticks++;
         }
         this.updateClients();
@@ -855,7 +1097,9 @@ class Server {
         // remove size from cell at decay rate
         if (cap && cell._mass > cap)
             rate *= 10;
-        var decay = 1 - rate * this.mode.decayMod;
+        var decay = this.antiTeam
+            ? this.antiTeam.getPerSecondDecayFactor(cell.owner, rate, this.mode.decayMod)
+            : Math.pow(Math.max(0, 1 - (rate * this.mode.decayMod / 25)), 25);
         cell.setSize(Math.sqrt(cell._radius2 * decay));
     }
     boostCell(cell) {
@@ -965,6 +1209,15 @@ class Server {
         // Consume effect
         check.onEat(cell);
         cell.onEaten(check);
+        if (this.antiTeam && check.type === 0 && check.owner) {
+            if (cell.type === 0 && cell.owner && cell.owner !== check.owner) {
+                this.antiTeam.onPlayerCellConsumed(check.owner, cell.owner, cell);
+            } else if (cell.type === 3) {
+                this.antiTeam.onEjectedMassConsumed(check.owner, cell.antiTeamSourcePlayer, cell);
+            } else if (cell.type === 2) {
+                this.antiTeam.onVirusConsumed(check.owner);
+            }
+        }
         cell.killer = check;
         // Remove cell
         this.removeNode(cell);
@@ -1166,6 +1419,9 @@ class Server {
                 ejected = new Entity.Virus(this, null, pos, this.config.ejectSize);
             } else {
                 ejected = new Entity.EjectedMass(this, null, pos, this.config.ejectSize);
+                ejected.antiTeamSourcePlayer = client;
+                ejected.antiTeamSourceTick = this.ticks;
+                ejected.antiTeamConsumed = false;
             }
             ejected.color = cell.color;
             ejected.setBoost(this.config.ejectVelocity, angle);

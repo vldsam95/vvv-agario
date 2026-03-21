@@ -45,6 +45,28 @@
         "multiControlMaxPilots",
     ];
 
+    const ANTI_TEAM_FIELDS = [
+        "antiTeamStateDecayPerTick",
+        "antiTeamMaxMultiplier",
+        "antiTeamApplyBase",
+        "antiTeamDecayScale",
+        "antiTeamPairWindowTicks",
+        "antiTeamMinPairEvents",
+        "antiTeamMaxPairsPerPlayer",
+        "antiTeamEjectWeight",
+        "antiTeamPlayerEatWeight",
+        "antiTeamVirusBurstMultiplier",
+        "antiTeamVirusBurstThreshold",
+        "antiTeamEjectWindowTicks",
+    ];
+
+    const ANTI_TEAM_CHECKBOXES = [
+        "antiTeamEnabled",
+        "antiTeamApplyToBots",
+        "antiTeamIgnoreLinkedPlayers",
+        "antiTeamIgnoreTeamBots",
+    ];
+
     function byId(id) {
         return document.getElementById(id);
     }
@@ -282,12 +304,16 @@
     }
 
     function fillServerForm() {
-        for (const id of SERVER_FIELDS.concat(PHYSICS_FIELDS)) {
+        for (const id of SERVER_FIELDS.concat(PHYSICS_FIELDS, ANTI_TEAM_FIELDS)) {
             const element = byId(id);
             if (element) element.value = state.serverSettings[id] ?? "";
         }
         byId("allowSkinUpload").checked = !!state.serverSettings.allowSkinUpload;
         byId("dualControlEnabled").checked = !!state.serverSettings.dualControlEnabled;
+        for (const id of ANTI_TEAM_CHECKBOXES) {
+            const element = byId(id);
+            if (element) element.checked = !!state.serverSettings[id];
+        }
         byId("botTargetCount").value = state.botSettings.targetCount ?? 0;
         byId("botAutoFill").checked = !!state.botSettings.autoFill;
         byId("modePresetsJson").value = JSON.stringify(state.modePresets, null, 2);
@@ -355,6 +381,10 @@
             multiControlMaxPilots: Number(byId("multiControlMaxPilots").value || 0),
             allowSkinUpload: byId("allowSkinUpload").checked,
             dualControlEnabled: byId("dualControlEnabled").checked,
+            antiTeamEnabled: byId("antiTeamEnabled").checked,
+            antiTeamApplyToBots: byId("antiTeamApplyToBots").checked,
+            antiTeamIgnoreLinkedPlayers: byId("antiTeamIgnoreLinkedPlayers").checked,
+            antiTeamIgnoreTeamBots: byId("antiTeamIgnoreTeamBots").checked,
             playerMaxCells: Number(byId("playerMaxCells").value || 0),
             playerStartSize: Number(byId("playerStartSize").value || 0),
             playerSpeed: Number(byId("playerSpeed").value || 0),
@@ -366,6 +396,18 @@
             virusAmount: Number(byId("virusAmount").value || 0),
             borderWidth: Number(byId("borderWidth").value || 0),
             borderHeight: Number(byId("borderHeight").value || 0),
+            antiTeamStateDecayPerTick: Number(byId("antiTeamStateDecayPerTick").value || 0),
+            antiTeamMaxMultiplier: Number(byId("antiTeamMaxMultiplier").value || 0),
+            antiTeamApplyBase: Number(byId("antiTeamApplyBase").value || 0),
+            antiTeamDecayScale: Number(byId("antiTeamDecayScale").value || 0),
+            antiTeamPairWindowTicks: Number(byId("antiTeamPairWindowTicks").value || 0),
+            antiTeamMinPairEvents: Number(byId("antiTeamMinPairEvents").value || 0),
+            antiTeamMaxPairsPerPlayer: Number(byId("antiTeamMaxPairsPerPlayer").value || 0),
+            antiTeamEjectWeight: Number(byId("antiTeamEjectWeight").value || 0),
+            antiTeamPlayerEatWeight: Number(byId("antiTeamPlayerEatWeight").value || 0),
+            antiTeamVirusBurstMultiplier: Number(byId("antiTeamVirusBurstMultiplier").value || 0),
+            antiTeamVirusBurstThreshold: Number(byId("antiTeamVirusBurstThreshold").value || 0),
+            antiTeamEjectWindowTicks: Number(byId("antiTeamEjectWindowTicks").value || 0),
         });
         state.botSettings = Object.assign({}, state.botSettings, {
             targetCount: Number(byId("botTargetCount").value || 0),

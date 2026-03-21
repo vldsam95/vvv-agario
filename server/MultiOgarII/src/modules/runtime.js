@@ -100,6 +100,7 @@ const DEFAULT_SERVER_SETTINGS = Object.freeze({
     serverTracker: 0,
     serverMaxConnections: 120,
     serverIpLimit: 3,
+    serverResumeGrace: 20,
     serverScrambleLevel: 1,
     serverChat: 1,
     serverChatAscii: 0,
@@ -109,6 +110,22 @@ const DEFAULT_SERVER_SETTINGS = Object.freeze({
     dualControlEnabled: true,
     dualControlSwitchCooldown: 8,
     multiControlMaxPilots: 2,
+    antiTeamEnabled: false,
+    antiTeamApplyToBots: false,
+    antiTeamIgnoreLinkedPlayers: true,
+    antiTeamIgnoreTeamBots: true,
+    antiTeamStateDecayPerTick: 0.997,
+    antiTeamMaxMultiplier: 2.8,
+    antiTeamApplyBase: 0.3,
+    antiTeamDecayScale: 3333,
+    antiTeamPairWindowTicks: 125,
+    antiTeamMinPairEvents: 2,
+    antiTeamMaxPairsPerPlayer: 24,
+    antiTeamEjectWeight: 1,
+    antiTeamPlayerEatWeight: 0.2,
+    antiTeamVirusBurstMultiplier: 1.4,
+    antiTeamVirusBurstThreshold: 1.15,
+    antiTeamEjectWindowTicks: 25,
     publicWsEndpoint: "/ws",
     publicTitle: "AgarVVV Arena",
     publicSubtitle: "MultiOgarII server with runtime presets, multi-cell control and admin-managed bots.",
@@ -201,6 +218,7 @@ const RUNTIME_FILES = Object.freeze({
     serverSettings: path.join(RUNTIME_DIR, "server-settings.json"),
     modePresets: path.join(RUNTIME_DIR, "mode-presets.json"),
     botSettings: path.join(RUNTIME_DIR, "bots.json"),
+    wsTicketSecret: path.join(RUNTIME_DIR, "ws-ticket-secret.json"),
     control: path.join(RUNTIME_DIR, "control.json"),
     state: path.join(RUNTIME_DIR, "server-state.json"),
 });
@@ -390,6 +408,10 @@ function normalizeServerSettings(raw) {
     settings.serverEnabled = settings.serverEnabled !== false;
     settings.allowSkinUpload = !!settings.allowSkinUpload;
     settings.dualControlEnabled = !!settings.dualControlEnabled;
+    settings.antiTeamEnabled = !!settings.antiTeamEnabled;
+    settings.antiTeamApplyToBots = !!settings.antiTeamApplyToBots;
+    settings.antiTeamIgnoreLinkedPlayers = settings.antiTeamIgnoreLinkedPlayers !== false;
+    settings.antiTeamIgnoreTeamBots = settings.antiTeamIgnoreTeamBots !== false;
     settings.serverBind = String(settings.serverBind || DEFAULT_SERVER_SETTINGS.serverBind);
     settings.clientBind = String(settings.clientBind || "");
     settings.activePreset = typeof settings.activePreset === "string" && settings.activePreset ? settings.activePreset : DEFAULT_SERVER_SETTINGS.activePreset;
@@ -405,6 +427,18 @@ function normalizeServerSettings(raw) {
     settings.virusAmount = clampNumber(settings.virusAmount, DEFAULT_SERVER_SETTINGS.virusAmount, 0, 1000);
     settings.borderWidth = clampNumber(settings.borderWidth, DEFAULT_SERVER_SETTINGS.borderWidth, 2000, 50000);
     settings.borderHeight = clampNumber(settings.borderHeight, DEFAULT_SERVER_SETTINGS.borderHeight, 2000, 50000);
+    settings.antiTeamStateDecayPerTick = clampNumber(settings.antiTeamStateDecayPerTick, DEFAULT_SERVER_SETTINGS.antiTeamStateDecayPerTick, 0.9, 0.99999);
+    settings.antiTeamMaxMultiplier = clampNumber(settings.antiTeamMaxMultiplier, DEFAULT_SERVER_SETTINGS.antiTeamMaxMultiplier, 1, 10);
+    settings.antiTeamApplyBase = clampNumber(settings.antiTeamApplyBase, DEFAULT_SERVER_SETTINGS.antiTeamApplyBase, 0, 5);
+    settings.antiTeamDecayScale = clampNumber(settings.antiTeamDecayScale, DEFAULT_SERVER_SETTINGS.antiTeamDecayScale, 1, 20000);
+    settings.antiTeamPairWindowTicks = clampNumber(settings.antiTeamPairWindowTicks, DEFAULT_SERVER_SETTINGS.antiTeamPairWindowTicks, 1, 1000);
+    settings.antiTeamMinPairEvents = clampNumber(settings.antiTeamMinPairEvents, DEFAULT_SERVER_SETTINGS.antiTeamMinPairEvents, 1, 10);
+    settings.antiTeamMaxPairsPerPlayer = clampNumber(settings.antiTeamMaxPairsPerPlayer, DEFAULT_SERVER_SETTINGS.antiTeamMaxPairsPerPlayer, 1, 128);
+    settings.antiTeamEjectWeight = clampNumber(settings.antiTeamEjectWeight, DEFAULT_SERVER_SETTINGS.antiTeamEjectWeight, 0, 5);
+    settings.antiTeamPlayerEatWeight = clampNumber(settings.antiTeamPlayerEatWeight, DEFAULT_SERVER_SETTINGS.antiTeamPlayerEatWeight, 0, 5);
+    settings.antiTeamVirusBurstMultiplier = clampNumber(settings.antiTeamVirusBurstMultiplier, DEFAULT_SERVER_SETTINGS.antiTeamVirusBurstMultiplier, 1, 5);
+    settings.antiTeamVirusBurstThreshold = clampNumber(settings.antiTeamVirusBurstThreshold, DEFAULT_SERVER_SETTINGS.antiTeamVirusBurstThreshold, 1, 10);
+    settings.antiTeamEjectWindowTicks = clampNumber(settings.antiTeamEjectWindowTicks, DEFAULT_SERVER_SETTINGS.antiTeamEjectWindowTicks, 1, 250);
     return settings;
 }
 

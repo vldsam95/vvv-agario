@@ -285,6 +285,14 @@ button {
     border-radius: 8px;
 }
 
+.anti-team-docs {
+    display: grid;
+    gap: 16px;
+    margin-top: 18px;
+    padding-top: 18px;
+    border-top: 1px solid var(--line);
+}
+
 .map-toolkit {
     display: grid;
     gap: 16px;
