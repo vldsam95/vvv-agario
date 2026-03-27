@@ -132,6 +132,10 @@ h1, h2 {
     gap: 14px;
 }
 
+.full-span {
+    grid-column: 1 / -1;
+}
+
 .form-grid.compact {
     grid-template-columns: repeat(3, minmax(0, 1fr));
 }
@@ -166,6 +170,12 @@ textarea {
     resize: vertical;
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     font-size: 13px;
+}
+
+.compact-scroll-input {
+    min-height: 160px;
+    max-height: 220px;
+    overflow-y: auto;
 }
 
 button {

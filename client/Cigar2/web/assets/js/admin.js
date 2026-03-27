@@ -25,6 +25,7 @@
         "playerSpeed",
         "splitVelocity",
         "ejectVelocity",
+        "ejectCooldown",
         "playerDecayRate",
         "playerRecombineTime",
         "foodAmount",
@@ -32,6 +33,7 @@
         "borderWidth",
         "borderHeight",
     ];
+    const TICK_MS = 40;
 
     const SERVER_FIELDS = [
         "serverName",
@@ -66,6 +68,47 @@
         "antiTeamIgnoreLinkedPlayers",
         "antiTeamIgnoreTeamBots",
     ];
+
+    function parseBulkNicknames(raw) {
+        if (typeof raw !== "string") return [];
+        const lines = raw.split(/\r?\n/);
+        const result = [];
+        const seen = new Set();
+        for (const line of lines) {
+            const nickname = line.trim().replace(/\s+/g, " ").slice(0, 60);
+            if (!nickname) continue;
+            const key = nickname.toLowerCase();
+            if (seen.has(key)) continue;
+            seen.add(key);
+            result.push(nickname);
+            if (result.length >= 300) break;
+        }
+        return result;
+    }
+
+    function massToSize(mass) {
+        const value = Number(mass);
+        if (!Number.isFinite(value) || value <= 0) return 0;
+        return Math.sqrt(value * 100);
+    }
+
+    function sizeToMass(size) {
+        const value = Number(size);
+        if (!Number.isFinite(value) || value <= 0) return 0;
+        return value * value / 100;
+    }
+
+    function ticksToMs(ticks) {
+        const value = Number(ticks);
+        if (!Number.isFinite(value) || value <= 0) return 0;
+        return Math.round(value * TICK_MS);
+    }
+
+    function msToTicks(ms) {
+        const value = Number(ms);
+        if (!Number.isFinite(value) || value <= 0) return 0;
+        return Math.max(0, Math.floor(value / TICK_MS));
+    }
 
     function byId(id) {
         return document.getElementById(id);
@@ -316,6 +359,11 @@
         }
         byId("botTargetCount").value = state.botSettings.targetCount ?? 0;
         byId("botAutoFill").checked = !!state.botSettings.autoFill;
+        byId("botBulkNicknames").value = Array.isArray(state.botSettings.bulkNicknames)
+            ? state.botSettings.bulkNicknames.join("\n")
+            : "";
+        byId("ejectCooldown").value = ticksToMs(state.serverSettings.ejectCooldown ?? 3);
+        byId("playerMaxMass").value = Math.round(sizeToMass(state.serverSettings.playerMaxSize ?? 1500));
         byId("modePresetsJson").value = JSON.stringify(state.modePresets, null, 2);
         renderPresetSelect();
         renderProfiles();
@@ -328,6 +376,8 @@
             const element = byId(field);
             if (element) element.value = values[field] ?? "";
         }
+        byId("ejectCooldown").value = ticksToMs(values.ejectCooldown ?? 3);
+        byId("playerMaxMass").value = Math.round(sizeToMass(values.playerMaxSize ?? 1500));
     }
 
     function applyPhysicsDefaults(kind) {
@@ -352,6 +402,12 @@
             const element = byId(field);
             if (element) element.value = preset.config[field];
         }
+        if (preset.config.playerMaxSize != null) {
+            byId("playerMaxMass").value = Math.round(sizeToMass(preset.config.playerMaxSize));
+        }
+        if (preset.config.ejectCooldown != null) {
+            byId("ejectCooldown").value = ticksToMs(preset.config.ejectCooldown);
+        }
         setMessage("saveMessage", `Preset "${preset.label || presetKey}" loaded into the form. Save to apply it live.`);
     }
 
@@ -368,6 +424,11 @@
     }
 
     function collectPayload() {
+        const playerMaxMassInput = Number(byId("playerMaxMass").value);
+        const fallbackPlayerMaxMass = Math.round(sizeToMass(state.serverSettings?.playerMaxSize ?? 1500));
+        const playerMaxMass = Number.isFinite(playerMaxMassInput) && playerMaxMassInput > 0
+            ? playerMaxMassInput
+            : fallbackPlayerMaxMass;
         state.serverSettings = Object.assign({}, state.serverSettings, {
             serverName: byId("serverName").value,
             activePreset: byId("activePreset").value,
@@ -388,8 +449,10 @@
             playerMaxCells: Number(byId("playerMaxCells").value || 0),
             playerStartSize: Number(byId("playerStartSize").value || 0),
             playerSpeed: Number(byId("playerSpeed").value || 0),
+            playerMaxSize: massToSize(playerMaxMass),
             splitVelocity: Number(byId("splitVelocity").value || 0),
             ejectVelocity: Number(byId("ejectVelocity").value || 0),
+            ejectCooldown: msToTicks(byId("ejectCooldown").value),
             playerDecayRate: Number(byId("playerDecayRate").value || 0),
             playerRecombineTime: Number(byId("playerRecombineTime").value || 0),
             foodAmount: Number(byId("foodAmount").value || 0),
@@ -412,6 +475,7 @@
         state.botSettings = Object.assign({}, state.botSettings, {
             targetCount: Number(byId("botTargetCount").value || 0),
             autoFill: byId("botAutoFill").checked,
+            bulkNicknames: parseBulkNicknames(byId("botBulkNicknames").value),
             profiles: collectProfiles(),
         });
         try {

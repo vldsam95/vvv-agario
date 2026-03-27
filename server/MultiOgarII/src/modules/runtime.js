@@ -10,8 +10,10 @@ const PHYSICS_FIELDS = Object.freeze([
     "playerMaxCells",
     "playerStartSize",
     "playerSpeed",
+    "playerMaxSize",
     "splitVelocity",
     "ejectVelocity",
+    "ejectCooldown",
     "playerDecayRate",
     "playerRecombineTime",
     "foodAmount",
@@ -24,8 +26,10 @@ const INITIAL_PHYSICS_DEFAULTS = Object.freeze({
     playerMaxCells: 16,
     playerStartSize: 20,
     playerSpeed: 1,
+    playerMaxSize: 1500,
     splitVelocity: 780,
     ejectVelocity: 780,
+    ejectCooldown: 3,
     playerDecayRate: 0.002,
     playerRecombineTime: 30,
     foodAmount: 850,
@@ -38,8 +42,10 @@ const VANILLA_PHYSICS_DEFAULTS = Object.freeze({
     playerMaxCells: 16,
     playerStartSize: 10,
     playerSpeed: 1,
+    playerMaxSize: 1500,
     splitVelocity: 780,
     ejectVelocity: 780,
+    ejectCooldown: 3,
     playerDecayRate: 0.002,
     playerRecombineTime: 30,
     foodAmount: 700,
@@ -50,15 +56,15 @@ const VANILLA_PHYSICS_DEFAULTS = Object.freeze({
 
 const ASTR_PHYSICS_DEFAULTS = Object.freeze({
     playerMaxCells: 16,
-    playerStartSize: 20,
-    playerSpeed: 0.82,
-    playerSpeedBase: 2.0,
-    playerSpeedExponent: -0.39,
+    playerStartSize: 50,
+    playerSpeed: 1,
+    playerMaxSize: 1500,
     splitVelocity: 660,
     ejectVelocity: 640,
+    ejectCooldown: 3,
     playerDecayRate: 0.0016,
-    playerRecombineTime: 36,
-    foodAmount: 900,
+    playerRecombineTime: 32,
+    foodAmount: 2200,
     virusAmount: 65,
     borderWidth: 14142.135623730952,
     borderHeight: 14142.135623730952,
@@ -175,6 +181,7 @@ const DEFAULT_MODE_PRESETS = Object.freeze({
 const DEFAULT_BOT_SETTINGS = Object.freeze({
     targetCount: 18,
     autoFill: false,
+    bulkNicknames: [],
     profiles: [
         {
             id: "balanced-core",
@@ -426,8 +433,10 @@ function normalizeServerSettings(raw) {
     settings.playerMaxCells = clampNumber(settings.playerMaxCells, DEFAULT_SERVER_SETTINGS.playerMaxCells, 2, 64);
     settings.playerStartSize = clampNumber(settings.playerStartSize, DEFAULT_SERVER_SETTINGS.playerStartSize, 1, 5000);
     settings.playerSpeed = clampNumber(settings.playerSpeed, DEFAULT_SERVER_SETTINGS.playerSpeed, 0.1, 4);
+    settings.playerMaxSize = clampNumber(settings.playerMaxSize, baseConfig.playerMaxSize, 1, 5000);
     settings.splitVelocity = clampNumber(settings.splitVelocity, DEFAULT_SERVER_SETTINGS.splitVelocity, 1, 5000);
     settings.ejectVelocity = clampNumber(settings.ejectVelocity, DEFAULT_SERVER_SETTINGS.ejectVelocity, 1, 5000);
+    settings.ejectCooldown = clampNumber(settings.ejectCooldown, baseConfig.ejectCooldown, 0, 180);
     settings.playerDecayRate = clampNumber(settings.playerDecayRate, DEFAULT_SERVER_SETTINGS.playerDecayRate, 0, 0.02);
     settings.playerRecombineTime = clampNumber(settings.playerRecombineTime, DEFAULT_SERVER_SETTINGS.playerRecombineTime, 0, 180);
     settings.foodAmount = clampNumber(settings.foodAmount, DEFAULT_SERVER_SETTINGS.foodAmount, 0, 10000);
@@ -460,6 +469,18 @@ function normalizeBotSettings(raw) {
     const settings = Object.assign({}, clone(DEFAULT_BOT_SETTINGS), raw && typeof raw === "object" ? raw : {});
     settings.targetCount = clampNumber(settings.targetCount, DEFAULT_BOT_SETTINGS.targetCount, 0, 500);
     settings.autoFill = !!settings.autoFill;
+    const bulkNicknames = Array.isArray(settings.bulkNicknames) ? settings.bulkNicknames : [];
+    const seenBulkNicknames = new Set();
+    settings.bulkNicknames = bulkNicknames
+        .map((value) => typeof value === "string" ? value.trim().replace(/\s+/g, " ").slice(0, 60) : "")
+        .filter((value) => {
+            if (!value) return false;
+            const key = value.toLowerCase();
+            if (seenBulkNicknames.has(key)) return false;
+            seenBulkNicknames.add(key);
+            return true;
+        })
+        .slice(0, 300);
     const profiles = Array.isArray(settings.profiles) ? settings.profiles : [];
     settings.profiles = profiles
         .map((profile, index) => ({

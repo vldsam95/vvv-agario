@@ -18,7 +18,9 @@
         "virusAmount": 60,
         "borderWidth": 14142.135623730952,
         "borderHeight": 14142.135623730952,
-        "playerStartSize": 20
+        "playerMaxSize": 1500,
+        "playerStartSize": 20,
+        "ejectCooldown": 3
       }
     },
     "astr": {
@@ -28,18 +30,18 @@
         "serverGamemode": 0,
         "serverName": "AgarVVV ASTR",
         "playerMaxCells": 16,
-        "playerSpeed": 0.82,
-        "playerSpeedBase": 2,
-        "playerSpeedExponent": -0.39,
+        "playerSpeed": 1,
         "splitVelocity": 660,
         "ejectVelocity": 640,
         "playerDecayRate": 0.0016,
-        "playerRecombineTime": 36,
-        "foodAmount": 900,
+        "playerRecombineTime": 32,
+        "foodAmount": 2200,
         "virusAmount": 65,
         "borderWidth": 14142.135623730952,
         "borderHeight": 14142.135623730952,
-        "playerStartSize": 20
+        "playerMaxSize": 1500,
+        "playerStartSize": 50,
+        "ejectCooldown": 3
       }
     }
   }

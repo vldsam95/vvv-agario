@@ -37,6 +37,9 @@ input[type=checkbox] {
 }
 #nick {
     width: 65%;
+    direction: ltr;
+    unicode-bidi: bidi-override;
+    text-align: left;
 }
 #skin {
     width: 33%;

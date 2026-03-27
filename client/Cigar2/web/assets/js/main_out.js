@@ -2763,20 +2763,22 @@
             let complexes = lines[i];
             for (let j = 0; j < complexes.length; j++) {
                 ctx.font = '18px Ubuntu';
-                complexes[j].width = ctx.measureText(complexes[j].text).width;
+                complexes[j].renderText = toStableLtrText(complexes[j].text);
+                complexes[j].width = ctx.measureText(complexes[j].renderText).width;
                 thisLineWidth += complexes[j].width;
             }
             width = Math.max(thisLineWidth, width);
         }
         canvas.width = width;
         canvas.height = height;
+        if ('direction' in ctx) ctx.direction = 'ltr';
         for (let i = 0; i < lines.length; i++) {
             let width = 0;
             let complexes = lines[i];
             for (let j = 0; j < complexes.length; j++) {
                 ctx.font = '18px Ubuntu';
                 ctx.fillStyle = complexes[j].color.toHex();
-                ctx.fillText(complexes[j].text, width, 20 * (1 + i));
+                ctx.fillText(complexes[j].renderText, width, 20 * (1 + i));
                 width += complexes[j].width;
             }
         }
@@ -2881,6 +2883,7 @@
             }
         } else {
             ctx.font = '20px Ubuntu';
+            if ('direction' in ctx) ctx.direction = 'ltr';
             for (let i = 0; i < leaderboard.items.length; i++) {
                 let isMe = false;
                 let text;
@@ -2892,9 +2895,10 @@
                 }
                 if (leaderboard.type === 'ffa') text = `${i + 1}. ${text}`;
                 ctx.fillStyle = isMe ? '#FAA' : '#FFF';
-                const width = ctx.measureText(text).width;
+                const renderText = toStableLtrText(text);
+                const width = ctx.measureText(renderText).width;
                 const start = width > 200 ? 2 : 100 - width * 0.5;
-                ctx.fillText(text, start, 70 + 24 * i);
+                ctx.fillText(renderText, start, 70 + 24 * i);
             }
         }
     }
@@ -3041,7 +3045,8 @@
         if (cell) {
             mainCtx.fillStyle = settings.darkTheme ? '#DDD' : '#222';
             mainCtx.font = `${sectorNameSize}px Ubuntu`;
-            mainCtx.fillText(cell.name || EMPTY_NAME, myPosX, myPosY - 7 - sectorNameSize / 2);
+            if ('direction' in mainCtx) mainCtx.direction = 'ltr';
+            mainCtx.fillText(toStableLtrText(cell.name || EMPTY_NAME), myPosX, myPosY - 7 - sectorNameSize / 2);
         }
 
         mainCtx.restore();
@@ -3691,30 +3696,40 @@
     window.cachedNames = cachedNames;
     window.cachedMass = cachedMass;
 
+    const BIDI_CONTROL_REGEX = /[\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
+    function toStableLtrText(value) {
+        const text = String(value == null ? '' : value).replace(BIDI_CONTROL_REGEX, '');
+        return text ? `\u202D${text}\u202C` : '';
+    }
+
     function drawTextOnto(canvas, ctx, text, size) {
+        const renderText = toStableLtrText(text);
         ctx.font = size + 'px Ubuntu';
         ctx.lineWidth = Math.max(~~(size / 10), 2);
-        canvas.width = ctx.measureText(text).width + 2 * ctx.lineWidth;
+        canvas.width = ctx.measureText(renderText).width + 2 * ctx.lineWidth;
         canvas.height = 4 * size;
         ctx.font = size + 'px Ubuntu';
         ctx.lineWidth = Math.max(~~(size / 10), 2);
         ctx.textBaseline = 'middle';
         ctx.textAlign = 'center';
+        if ('direction' in ctx) ctx.direction = 'ltr';
         ctx.fillStyle = '#FFF'
         ctx.strokeStyle = '#000';
         ctx.translate(canvas.width / 2, 2 * size);
-        (ctx.lineWidth !== 1) && ctx.strokeText(text, 0, 0);
-        ctx.fillText(text, 0, 0);
+        (ctx.lineWidth !== 1) && ctx.strokeText(renderText, 0, 0);
+        ctx.fillText(renderText, 0, 0);
     }
     function drawRaw(ctx, x, y, text, size) {
+        const renderText = toStableLtrText(text);
         ctx.font = size + 'px Ubuntu';
         ctx.textBaseline = 'middle';
         ctx.textAlign = 'center';
+        if ('direction' in ctx) ctx.direction = 'ltr';
         ctx.lineWidth = Math.max(~~(size / 10), 2);
         ctx.fillStyle = '#FFF'
         ctx.strokeStyle = '#000';
-        (ctx.lineWidth !== 1) && ctx.strokeText(text, x, y);
-        ctx.fillText(text, x, y);
+        (ctx.lineWidth !== 1) && ctx.strokeText(renderText, x, y);
+        ctx.fillText(renderText, x, y);
         ctx.restore();
     }
     function newNameCache(value, size) {

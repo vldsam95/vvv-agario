@@ -12,8 +12,13 @@ const botnameFile = "./ai/botnames.txt";
 const gallerySkinListFile = path.resolve(__dirname, "../../../../client/Cigar2/web/skinList.txt");
 const gallerySkinsDir = path.resolve(__dirname, "../../../../client/Cigar2/web/skins");
 let botnames = null;
-if(fs.existsSync(botnameFile))
-    botnames = fs.readFileSync(botnameFile, "utf-8").split("\n");
+if (fs.existsSync(botnameFile)) {
+    botnames = fs.readFileSync(botnameFile, "utf-8")
+        .split(/\r?\n/)
+        .map((value) => String(value || "").trim())
+        .filter(Boolean);
+    if (!botnames.length) botnames = null;
+}
 
 function sanitizeSkinName(value) {
     return String(value || "")
@@ -21,6 +26,13 @@ function sanitizeSkinName(value) {
         .replace(/[^a-z0-9_-]+/g, "-")
         .replace(/^-+|-+$/g, "")
         .slice(0, 96);
+}
+
+function normalizeBotNamePart(value, maxLength = 32) {
+    return String(value || "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, maxLength);
 }
 
 class BotLoader {
@@ -78,10 +90,119 @@ class BotLoader {
         this.profileCursor++;
         return profile;
     }
-    composeName(profile) {
-        const suffix = `${++this.botCount}`.padStart(2, "0");
-        const prefix = profile.namePrefix || profile.label || "Bot";
-        return `${prefix} ${suffix}`;
+    getNicknameLimit() {
+        const configured = Number(this.server?.config?.playerMaxNickLength);
+        if (!Number.isFinite(configured) || configured < 3) return 30;
+        return Math.max(3, Math.min(64, Math.floor(configured)));
+    }
+    formatBotName(prefix, suffix) {
+        const limit = this.getNicknameLimit();
+        const safePrefix = normalizeBotNamePart(prefix, limit);
+        const safeSuffix = normalizeBotNamePart(suffix, limit);
+        if (!safePrefix && !safeSuffix) return "Bot".slice(0, limit);
+        if (!safePrefix) return safeSuffix.slice(0, limit) || "Bot";
+        if (!safeSuffix) return safePrefix.slice(0, limit) || "Bot";
+        const suffixPart = safeSuffix.slice(0, Math.max(1, Math.min(safeSuffix.length, limit - 1)));
+        let prefixRoom = limit - suffixPart.length - 1;
+        if (prefixRoom < 1) {
+            return suffixPart.slice(0, limit) || "Bot";
+        }
+        const prefixPart = safePrefix.slice(0, prefixRoom).trim();
+        if (!prefixPart) return suffixPart.slice(0, limit) || "Bot";
+        const name = `${prefixPart} ${suffixPart}`;
+        return name.slice(0, limit).trim() || "Bot";
+    }
+    getUsedBotDisplayNames() {
+        const used = new Set();
+        for (const socket of this.getBotSockets()) {
+            const name = normalizeBotNamePart(socket?.player?._name, this.getNicknameLimit());
+            if (name) used.add(name.toLowerCase());
+        }
+        return used;
+    }
+    getConfiguredBulkNicknames() {
+        const settings = this.server.botSettings || {};
+        const configured = Array.isArray(settings.bulkNicknames) ? settings.bulkNicknames : [];
+        const seen = new Set();
+        const nicknames = [];
+        for (const value of configured) {
+            const nickname = normalizeBotNamePart(value, 60);
+            if (!nickname) continue;
+            const key = nickname.toLowerCase();
+            if (seen.has(key)) continue;
+            seen.add(key);
+            nicknames.push({nickname, key});
+        }
+        return nicknames;
+    }
+    getUsedBulkNicknameKeys() {
+        const used = new Set();
+        for (const socket of this.getBotSockets()) {
+            const key = normalizeBotNamePart(socket?.player?.botNicknameKey, 60).toLowerCase();
+            if (key) used.add(key);
+        }
+        return used;
+    }
+    composeNumericName(profile, usedDisplayNames) {
+        const prefix = profile?.namePrefix || profile?.label || "Bot";
+        for (let attempts = 0; attempts < 5000; attempts++) {
+            const suffix = `${++this.botCount}`.padStart(2, "0");
+            const candidate = this.formatBotName(prefix, suffix);
+            if (!usedDisplayNames.has(candidate.toLowerCase())) {
+                return candidate;
+            }
+        }
+        return this.formatBotName(prefix, `${Date.now() % 100000}`);
+    }
+    pickLegacyBotName(usedDisplayNames) {
+        if (!Array.isArray(botnames) || !botnames.length) return "";
+        for (let attempts = 0; attempts < botnames.length * 2; attempts++) {
+            const raw = botnames[Math.random() * botnames.length | 0];
+            const candidate = normalizeBotNamePart(raw, this.getNicknameLimit());
+            if (!candidate) continue;
+            if (usedDisplayNames.has(candidate.toLowerCase())) continue;
+            return candidate;
+        }
+        return "";
+    }
+    pickBulkBotName(profile, usedDisplayNames, configuredBulkNicknames) {
+        if (!configuredBulkNicknames.length) return null;
+        const usedKeys = this.getUsedBulkNicknameKeys();
+        const pool = configuredBulkNicknames.filter((entry) => !usedKeys.has(entry.key));
+        while (pool.length) {
+            const index = Math.random() * pool.length | 0;
+            const choice = pool.splice(index, 1)[0];
+            const candidate = this.formatBotName(profile?.namePrefix || profile?.label || "Bot", choice.nickname);
+            if (usedDisplayNames.has(candidate.toLowerCase())) continue;
+            return {
+                name: candidate,
+                nicknameKey: choice.key,
+            };
+        }
+        return null;
+    }
+    resolveSpawnName(profile) {
+        const usedDisplayNames = this.getUsedBotDisplayNames();
+        const configuredBulkNicknames = this.getConfiguredBulkNicknames();
+        if (configuredBulkNicknames.length) {
+            const bulk = this.pickBulkBotName(profile, usedDisplayNames, configuredBulkNicknames);
+            if (bulk) return bulk;
+            return {
+                name: this.composeNumericName(profile, usedDisplayNames),
+                nicknameKey: null,
+            };
+        }
+        const legacyName = this.pickLegacyBotName(usedDisplayNames);
+        if (legacyName) {
+            return {
+                name: legacyName,
+                nicknameKey: null,
+            };
+        }
+        return {
+            name: this.composeNumericName(profile, usedDisplayNames),
+            nicknameKey: null,
+        };
     }
     getGallerySkins() {
         const skins = new Set();
@@ -134,11 +255,11 @@ class BotLoader {
         socket.player = new BotPlayer(this.server, socket);
         socket.client = new Client(this.server, socket);
         socket.player.botProfile = profileOverride || this.pickProfile();
+        const spawnName = this.resolveSpawnName(socket.player.botProfile);
+        socket.player.botNicknameKey = spawnName.nicknameKey;
         const skin = this.resolveProfileSkin(socket.player.botProfile);
 
-        let name = botnames ?
-            botnames[Math.random() * botnames.length | 0] :
-            this.composeName(socket.player.botProfile);
+        let name = spawnName.name;
         if (skin) {
             name = `<${skin}>${name}`;
         }

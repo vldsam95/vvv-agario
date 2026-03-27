@@ -84,8 +84,10 @@
                         <label>Player max cells<input id="playerMaxCells" type="number" min="2" max="64"></label>
                         <label>Start mass (players/bots/multi)<input id="playerStartSize" type="number" min="1" step="1"></label>
                         <label>Player speed<input id="playerSpeed" type="number" step="0.01"></label>
+                        <label>Auto-split max mass<input id="playerMaxMass" type="number" min="1" step="1"></label>
                         <label>Split velocity<input id="splitVelocity" type="number" step="1"></label>
-                        <label>Eject velocity<input id="ejectVelocity" type="number" step="1"></label>
+                        <label>W feed velocity<input id="ejectVelocity" type="number" step="1"></label>
+                        <label>W feed rate (cooldown ms)<input id="ejectCooldown" type="number" min="0" step="10"></label>
                         <label>Decay rate<input id="playerDecayRate" type="number" step="0.0001"></label>
                         <label>Recombine time<input id="playerRecombineTime" type="number" step="1"></label>
                         <label>Food amount<input id="foodAmount" type="number" step="1"></label>
@@ -234,7 +236,11 @@
                     <div class="form-grid">
                         <label>Target count<input id="botTargetCount" type="number" min="0"></label>
                         <label class="checkbox-row"><input id="botAutoFill" type="checkbox">Auto-fill with bots</label>
+                        <label class="full-span">Bulk nicknames (one per line)
+                            <textarea id="botBulkNicknames" class="compact-scroll-input" rows="8" placeholder="Ghost&#10;Falcon&#10;Nova"></textarea>
+                        </label>
                     </div>
+                    <p class="card-note">Bots use <code>Name prefix + nickname</code> from this list. Every nickname is unique on the map; when the list runs out, numeric names are used.</p>
                     <div class="profile-toolbar">
                         <button id="addProfileBtn" class="ghost-button" type="button">Add Profile</button>
                     </div>
@@ -253,7 +259,7 @@
                             <li><strong>Skin</strong>: המראה של הבוט. יש להזין שם של סקין קיים מתוך Available Skins.</li>
                             <li><strong>Random skin</strong>: אם מסומן, הבוט יקבל בכל spawn סקין אקראי מתוך הגלריה במקום הסקין הידני.</li>
                             <li><strong>Spawn weight</strong>: קובע כמה פעמים הפרופיל הזה ייבחר יחסית לאחרים. זה לא כוח.</li>
-                            <li><strong>Name prefix</strong>: תחילת השם של הבוטים מהפרופיל הזה.</li>
+                            <li><strong>Name prefix</strong>: תחילת השם של הבוטים מהפרופיל הזה. אם הוגדר Bulk nicknames, הבוט יקבל <code>prefix + nickname</code>.</li>
                         </ul>
                     </div>
 
