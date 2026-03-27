@@ -30,8 +30,8 @@
             var diagId = "diag-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
             var reportSent = {};
             var timeoutId = 0;
-            var primaryMainScriptUrl = "assets/js/game-client.js?v=20260327-tabfix-v2";
-            var fallbackMainScriptUrl = "assets/js/main_out.js?v=20260327-tabfix-v2";
+            var primaryMainScriptUrl = "assets/js/game-client.js?v=20260327-smart-dualcam-v6";
+            var fallbackMainScriptUrl = "assets/js/main_out.js?v=20260327-smart-dualcam-v6";
             var scriptStartCheckId = 0;
             var mainScriptFailedUrls = [];
             var fallbackScriptInjected = false;
@@ -457,7 +457,7 @@
     <script id="agar-main-script"
         defer
         data-agar-main-candidate="1"
-        src="assets/js/game-client.js?v=20260327-tabfix-v2"
+        src="assets/js/game-client.js?v=20260327-smart-dualcam-v6"
         onload="window.__AGAR_BOOT_GUARD && window.__AGAR_BOOT_GUARD.markMainResourceLoaded(this.src)"
         onerror="window.__AGAR_BOOT_GUARD && window.__AGAR_BOOT_GUARD.markMainFailed(this.src)"></script>
     <script defer src="assets/js/agarvvv-ui.js?v=20260312-skinslots"></script>
@@ -615,6 +615,7 @@
                     <label><input id="showPosition" type="checkbox">Coordinates</label>
                     <label><input id="showBorder" type="checkbox">Border</label>
                     <label><input id="showGrid" type="checkbox">Grid</label>
+                    <label><input id="smartDualCamera" type="checkbox">Smart dual camera</label>
                     <label><input id="moreZoom" type="checkbox">Extra zoom-out</label>
                     <label><input id="fillSkin" type="checkbox">Fill skin</label>
                     <label><input id="backgroundSectors" type="checkbox">Sector grid</label>

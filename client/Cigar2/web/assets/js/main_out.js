@@ -986,6 +986,7 @@
         dualCellState.enabled = false;
         dualCellState.activeIds.clear();
         dualCellState.inactiveIds.clear();
+        clearSmartDualCameraState();
     }
     function resetHumanMinimapState() {
         minimapHumans.entries = [];
@@ -1057,6 +1058,7 @@
         ws._agarDiagId = ensureConnectionDiagnostic(url).diagId;
         ws._agarOpened = false;
         ws._agarStable = false;
+        ws._smartDualPrefSent = false;
         ws.binaryType = 'arraybuffer';
         updateConnectionDiagnostic({
             stage: 'socket_created',
@@ -1232,10 +1234,21 @@
         if (data.build) ws.send(data.build());
         else ws.send(data);
     }
+    function sendSmartDualCameraPreference() {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        const writer = new Writer();
+        writer.setUint8(32);
+        writer.setUint8(settings.smartDualCamera ? 1 : 0);
+        wsSend(writer);
+    }
 
     function wsMessage(data) {
         if (data.currentTarget && data.currentTarget !== ws) return;
         markWsStable();
+        if (ws && !ws._smartDualPrefSent) {
+            sendSmartDualCameraPreference();
+            ws._smartDualPrefSent = true;
+        }
         syncUpdStamp = Date.now();
         const reader = new Reader(new DataView(data.data), 0, true);
         const packetId = reader.getUint8();
@@ -1402,9 +1415,12 @@
                     wsSend(UINT8_CACHE[254]);
                     stats.pingLoopStamp = Date.now();
                 }, 2000);
+                sendSmartDualCameraPreference();
                 break;
             }
             case 0x72: { // dual control state
+                const previousActive = dualCellState.activeIds;
+                const previousInactive = dualCellState.inactiveIds;
                 const flags = reader.getUint8();
                 const nextActive = new Set();
                 const activeCount = reader.getUint16();
@@ -1420,6 +1436,7 @@
                 dualCellState.inactiveIds = nextInactive;
                 dualCellState.enabled = !!(flags & 0x01) && nextInactive.size > 0;
                 dualControlActive = dualCellState.enabled;
+                scheduleSmartDualCameraDecision(previousActive, previousInactive, nextActive, nextInactive);
                 break;
             }
             case 0x73: { // minimap humans
@@ -1811,6 +1828,15 @@
         activeIds: new Set(),
         inactiveIds: new Set(),
     };
+    const SMART_DUAL_SWITCH_INTENT_WINDOW_MS = 1200;
+    const SMART_DUAL_PENDING_TIMEOUT_MS = 2000;
+    const dualCameraAssist = {
+        switchIntentAt: 0,
+        lockToInactive: false,
+        pendingSwitch: null,
+        sharedMode: false,
+        smoothedTarget: null,
+    };
     const minimapHumans = {
         entries: [],
         updatedAt: 0,
@@ -1849,6 +1875,7 @@
         showPosition: false,
         showBorder: false,
         showGrid: true,
+        smartDualCamera: true,
         playSounds: false,
         soundsVolume: 0.5,
         moreZoom: false,
@@ -2640,6 +2667,12 @@
             elm.addEventListener('change', () => {
                 settings[id] = elm[prop];
                 if (id === 'showSkins') pumpSkinQueue();
+                if (id === 'smartDualCamera' && !settings.smartDualCamera) {
+                    clearSmartDualCameraState();
+                }
+                if (id === 'smartDualCamera') {
+                    sendSmartDualCameraPreference();
+                }
             });
         }
         switch (elm.tagName.toLowerCase()) {
@@ -3173,17 +3206,202 @@
             camera.sizeScale = Math.pow(Math.min(64 / s, 1), 0.4);
             camera.target.scale = camera.sizeScale;
             camera.target.scale *= camera.viewportScale * camera.userZoom;
-            camera.x = (camera.target.x + camera.x) / 2;
-            camera.y = (camera.target.y + camera.y) / 2;
             stats.score = score;
             stats.maxScore = Math.max(stats.maxScore, score);
         } else {
             stats.score = NaN;
             stats.maxScore = 0;
+        }
+        resolvePendingSmartDualCameraDecision();
+        const smartLockApplied = applySmartDualCameraLock();
+        if (myCells.length > 0 || smartLockApplied) {
+            camera.x = (camera.target.x + camera.x) / 2;
+            camera.y = (camera.target.y + camera.y) / 2;
+        } else {
             camera.x += (camera.target.x - camera.x) / 20;
             camera.y += (camera.target.y - camera.y) / 20;
         }
         camera.scale += (camera.target.scale - camera.scale) / 9;
+    }
+    function clearSmartDualCameraState() {
+        dualCameraAssist.lockToInactive = false;
+        dualCameraAssist.pendingSwitch = null;
+        dualCameraAssist.sharedMode = false;
+        dualCameraAssist.smoothedTarget = null;
+    }
+    function registerDualCameraSwitchIntent() {
+        dualCameraAssist.switchIntentAt = Date.now();
+    }
+    function countIdIntersection(a, b) {
+        if (!a || !b || !a.size || !b.size) return 0;
+        let count = 0;
+        const [smaller, larger] = a.size <= b.size ? [a, b] : [b, a];
+        for (const id of smaller) {
+            if (larger.has(id)) ++count;
+        }
+        return count;
+    }
+    function getLargestCellFromIds(ids) {
+        let largestCell = null;
+        if (!ids) return largestCell;
+        for (const id of ids) {
+            const cell = cells.byId.get(id);
+            if (!cell) continue;
+            if (!largestCell || cell.s > largestCell.s) largestCell = cell;
+        }
+        return largestCell;
+    }
+    function getCameraScaleForSize(totalSize) {
+        const safeSize = Math.max(totalSize || 0, 1);
+        let scale = Math.pow(Math.min(64 / safeSize, 1), 0.4);
+        scale *= camera.viewportScale * camera.userZoom;
+        return Math.max(scale, 0.0001);
+    }
+    function getCellGroupFromIds(ids) {
+        if (!(ids instanceof Set) || ids.size < 1) return null;
+        let count = 0;
+        let totalSize = 0;
+        let maxSize = 0;
+        let sumX = 0;
+        let sumY = 0;
+        for (const id of ids) {
+            const cell = cells.byId.get(id);
+            if (!cell) continue;
+            count++;
+            sumX += cell.x;
+            sumY += cell.y;
+            totalSize += cell.s;
+            if (cell.s > maxSize) maxSize = cell.s;
+        }
+        if (!count || totalSize <= 0) return null;
+        return {
+            x: sumX / count,
+            y: sumY / count,
+            totalSize,
+            maxSize,
+        };
+    }
+    function getCameraScaleForIds(ids) {
+        const group = getCellGroupFromIds(ids);
+        return group ? getCameraScaleForSize(group.totalSize) : null;
+    }
+    function isPointInsideView(pointX, pointY, focusX, focusY, focusScale, coverage = 0.92) {
+        if (!Number.isFinite(focusScale) || focusScale <= 0) return false;
+        const viewportWidth = mainCanvas ? mainCanvas.width : Math.max(window.innerWidth || 0, 1920);
+        const viewportHeight = mainCanvas ? mainCanvas.height : Math.max(window.innerHeight || 0, 1080);
+        const halfWidth = viewportWidth / (2 * focusScale) * coverage;
+        const halfHeight = viewportHeight / (2 * focusScale) * coverage;
+        return Math.abs(pointX - focusX) <= halfWidth &&
+            Math.abs(pointY - focusY) <= halfHeight;
+    }
+    function getSharedDualCameraTarget(activeGroup, focusGroup, activeScale, focusScale, coverage = 0.96) {
+        if (!activeGroup || !focusGroup) return null;
+        if (!isPointInsideView(activeGroup.x, activeGroup.y, focusGroup.x, focusGroup.y, focusScale, coverage)) {
+            return null;
+        }
+        const viewportWidth = mainCanvas ? mainCanvas.width : Math.max(window.innerWidth || 0, 1920);
+        const viewportHeight = mainCanvas ? mainCanvas.height : Math.max(window.innerHeight || 0, 1080);
+        const margin = Math.max(220, activeGroup.maxSize + focusGroup.maxSize);
+        const spanX = Math.abs(activeGroup.x - focusGroup.x) + margin * 2;
+        const spanY = Math.abs(activeGroup.y - focusGroup.y) + margin * 2;
+        const fitScaleX = viewportWidth / Math.max(spanX, 1);
+        const fitScaleY = viewportHeight / Math.max(spanY, 1);
+        const baseScale = Math.min(
+            Number.isFinite(activeScale) ? activeScale : Infinity,
+            Number.isFinite(focusScale) ? focusScale : Infinity
+        );
+        if (!Number.isFinite(baseScale) || baseScale <= 0) return null;
+        return {
+            x: (activeGroup.x + focusGroup.x) / 2,
+            y: (activeGroup.y + focusGroup.y) / 2,
+            scale: Math.max(0.0001, Math.min(baseScale, fitScaleX, fitScaleY)),
+        };
+    }
+    function scheduleSmartDualCameraDecision(previousActive, previousInactive, nextActive, nextInactive) {
+        if (!settings.smartDualCamera) {
+            clearSmartDualCameraState();
+            return;
+        }
+        if (!(nextInactive instanceof Set) || nextInactive.size < 1) {
+            clearSmartDualCameraState();
+            return;
+        }
+        const switchedFromInactive = countIdIntersection(previousInactive, nextActive) > 0;
+        const movedPreviousActiveToInactive = countIdIntersection(previousActive, nextInactive) > 0;
+        if (!switchedFromInactive && !movedPreviousActiveToInactive) return;
+        if (Date.now() - dualCameraAssist.switchIntentAt > SMART_DUAL_SWITCH_INTENT_WINDOW_MS) return;
+        dualCameraAssist.switchIntentAt = 0;
+        dualCameraAssist.pendingSwitch = {
+            createdAt: Date.now(),
+            previousActiveIds: Array.from(previousActive),
+            nextActiveIds: Array.from(nextActive),
+        };
+    }
+    function resolvePendingSmartDualCameraDecision() {
+        const pending = dualCameraAssist.pendingSwitch;
+        if (!pending) return;
+        if (!settings.smartDualCamera || !dualCellState.enabled) {
+            clearSmartDualCameraState();
+            return;
+        }
+        if (Date.now() - pending.createdAt > SMART_DUAL_PENDING_TIMEOUT_MS) {
+            dualCameraAssist.pendingSwitch = null;
+            return;
+        }
+        const previousActiveLargest = getLargestCellFromIds(pending.previousActiveIds);
+        const nextActiveLargest = getLargestCellFromIds(pending.nextActiveIds);
+        if (!previousActiveLargest || !nextActiveLargest) return;
+        const previousScale = getCameraScaleForSize(previousActiveLargest.s);
+        dualCameraAssist.lockToInactive = previousActiveLargest.s > nextActiveLargest.s &&
+            isPointInsideView(
+                nextActiveLargest.x,
+                nextActiveLargest.y,
+                previousActiveLargest.x,
+                previousActiveLargest.y,
+                previousScale,
+                0.92
+            );
+        dualCameraAssist.pendingSwitch = null;
+    }
+    function applySmartDualCameraLock() {
+        if (!settings.smartDualCamera || !dualCellState.enabled) return false;
+        const activeGroup = getCellGroupFromIds(dualCellState.activeIds);
+        const inactiveGroup = getCellGroupFromIds(dualCellState.inactiveIds);
+        if (!activeGroup || !inactiveGroup || inactiveGroup.totalSize <= activeGroup.totalSize) {
+            dualCameraAssist.lockToInactive = false;
+            dualCameraAssist.sharedMode = false;
+            dualCameraAssist.smoothedTarget = null;
+            return false;
+        }
+        const activeScale = getCameraScaleForIds(dualCellState.activeIds);
+        const inactiveScale = getCameraScaleForIds(dualCellState.inactiveIds);
+        const coverage = dualCameraAssist.sharedMode ? 1.08 : 0.96;
+        const sharedTarget = getSharedDualCameraTarget(activeGroup, inactiveGroup, activeScale, inactiveScale, coverage);
+        if (!sharedTarget) {
+            dualCameraAssist.lockToInactive = false;
+            dualCameraAssist.sharedMode = false;
+            dualCameraAssist.smoothedTarget = null;
+            return false;
+        }
+        dualCameraAssist.lockToInactive = true;
+        dualCameraAssist.sharedMode = true;
+        if (!dualCameraAssist.smoothedTarget) {
+            dualCameraAssist.smoothedTarget = {
+                x: sharedTarget.x,
+                y: sharedTarget.y,
+                scale: sharedTarget.scale,
+            };
+        } else {
+            const smoothing = 0.45;
+            dualCameraAssist.smoothedTarget.x += (sharedTarget.x - dualCameraAssist.smoothedTarget.x) * smoothing;
+            dualCameraAssist.smoothedTarget.y += (sharedTarget.y - dualCameraAssist.smoothedTarget.y) * smoothing;
+            dualCameraAssist.smoothedTarget.scale += (sharedTarget.scale - dualCameraAssist.smoothedTarget.scale) * smoothing;
+        }
+        camera.target.x = dualCameraAssist.smoothedTarget.x;
+        camera.target.y = dualCameraAssist.smoothedTarget.y;
+        camera.target.scale = dualCameraAssist.smoothedTarget.scale;
+        camera.sizeScale = camera.target.scale / Math.max(camera.viewportScale * camera.userZoom, 0.0001);
+        return true;
     }
     function sqDist(a, b) {
         return (a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y);
@@ -3607,6 +3825,7 @@
         if (key === 'tab') {
             event.preventDefault();
             if (event.repeat) return;
+            registerDualCameraSwitchIntent();
             if (event.shiftKey) {
                 resetDualControlVisualState();
                 wsSend(UINT8_CACHE[27]);

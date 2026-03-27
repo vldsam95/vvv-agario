@@ -72,6 +72,7 @@ class Client {
             29: this.msg_doubleSplit.bind(this),
             30: this.msg_quadSplit.bind(this),
             31: this.msg_restart.bind(this),
+            32: this.msg_smartDualCameraPreference.bind(this),
             99: this.message_onChat.bind(this),
             254: this.message_onStat.bind(this),
         };
@@ -145,6 +146,10 @@ class Client {
     msg_restart(message) {
         if (message.length !== 1) return;
         this.socket.player.requestRestart?.();
+    }
+    msg_smartDualCameraPreference(message) {
+        if (message.length !== 2) return;
+        this.socket.player.setSmartDualCameraEnabled?.(!!message[1]);
     }
     msg_spectateToggle(message) {
         if (message.length !== 1) return;

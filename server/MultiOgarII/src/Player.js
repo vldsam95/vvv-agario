@@ -84,6 +84,9 @@ class Player {
         this.multiControl = {
             enabled: false,
             activePlayer: this,
+            viewLockPlayer: null,
+            smartDualCameraEnabled: true,
+            sharedCameraMode: false,
             lastActionTick: 0,
             linkedPlayers: [this],
             pendingOwnedRefresh: false,
@@ -281,6 +284,16 @@ class Player {
                 }
             }
         }
+        const lockedViewPlayer = controller.multiControl.viewLockPlayer;
+        if (lockedViewPlayer && (
+            !controller.multiControl.smartDualCameraEnabled ||
+            !controller.getLinkedPlayers().includes(lockedViewPlayer) ||
+            lockedViewPlayer.isRemoved ||
+            !sanitizePlayerCells(lockedViewPlayer).length ||
+            lockedViewPlayer === controller.multiControl.activePlayer
+        )) {
+            controller.multiControl.viewLockPlayer = null;
+        }
     }
     resetMultiControlState() {
         const controller = this.getLinkedController();
@@ -302,6 +315,9 @@ class Player {
         controller.multiControl = {
             enabled: false,
             activePlayer: controller,
+            viewLockPlayer: null,
+            smartDualCameraEnabled: true,
+            sharedCameraMode: false,
             lastActionTick: 0,
             linkedPlayers: [controller],
             pendingOwnedRefresh: false,
@@ -344,6 +360,146 @@ class Player {
     }
     getControlledCells() {
         return this.getControlledPlayer().getSelectableCells();
+    }
+    setSmartDualCameraEnabled(enabled) {
+        const controller = this.getLinkedController();
+        if (controller !== this) return controller.setSmartDualCameraEnabled(enabled);
+        controller.multiControl.smartDualCameraEnabled = !!enabled;
+        if (!controller.multiControl.smartDualCameraEnabled) {
+            controller.multiControl.viewLockPlayer = null;
+            controller.multiControl.sharedCameraMode = false;
+        }
+    }
+    getLargestSelectableCell(player) {
+        const selectable = player?.getSelectableCells?.() || [];
+        let largest = null;
+        for (const cell of selectable) {
+            if (!cell || cell.isRemoved) continue;
+            if (!largest || cell.radius > largest.radius) largest = cell;
+        }
+        return largest;
+    }
+    getLargestLinkedPlayer(preferredPlayer = null) {
+        const controller = this.getLinkedController();
+        if (controller !== this) return controller.getLargestLinkedPlayer(preferredPlayer);
+        let bestPlayer = null;
+        let bestRadius = -1;
+        for (const player of controller.getLinkedPlayers()) {
+            if (!player || player.isRemoved) continue;
+            const largestCell = controller.getLargestSelectableCell(player);
+            if (!largestCell) continue;
+            if (
+                largestCell.radius > bestRadius ||
+                (largestCell.radius === bestRadius && preferredPlayer && player === preferredPlayer)
+            ) {
+                bestPlayer = player;
+                bestRadius = largestCell.radius;
+            }
+        }
+        return bestPlayer;
+    }
+    isPlayerInViewOfPlayer(targetPlayer, focusPlayer) {
+        const focusCell = this.getLargestSelectableCell(focusPlayer);
+        const targetCell = this.getLargestSelectableCell(targetPlayer);
+        if (!focusCell || !targetCell) return false;
+        const scale = Math.max(focusPlayer._scale || focusPlayer.getLivingScale(), this.server.config.serverMinScale);
+        const halfWidth = (this.server.config.serverViewBaseX + 100) / scale / 2;
+        const halfHeight = (this.server.config.serverViewBaseY + 100) / scale / 2;
+        return Math.abs(targetCell.position.x - focusPlayer.centerPos.x) <= halfWidth &&
+            Math.abs(targetCell.position.y - focusPlayer.centerPos.y) <= halfHeight;
+    }
+    getSharedDualCameraView(activePlayer, focusPlayer) {
+        if (!activePlayer || !focusPlayer || activePlayer === focusPlayer) return null;
+        const controller = this.getLinkedController();
+        if (controller !== this) return controller.getSharedDualCameraView(activePlayer, focusPlayer);
+        const focusLargestCell = controller.getLargestSelectableCell(focusPlayer);
+        const activeLargestCell = controller.getLargestSelectableCell(activePlayer);
+        if (!focusLargestCell || !activeLargestCell) return null;
+        const minScale = this.server.config.serverMinScale;
+        const activeScale = Math.max(activePlayer._scale || activePlayer.getLivingScale(), minScale);
+        const focusScale = Math.max(focusPlayer._scale || focusPlayer.getLivingScale(), minScale);
+        const baseWidth = this.server.config.serverViewBaseX + 100;
+        const baseHeight = this.server.config.serverViewBaseY + 100;
+        const coverage = controller.multiControl.sharedCameraMode ? 1.08 : 0.96;
+        const focusHalfWidth = baseWidth / focusScale / 2;
+        const focusHalfHeight = baseHeight / focusScale / 2;
+        const near = Math.abs(activePlayer.centerPos.x - focusPlayer.centerPos.x) <= focusHalfWidth * coverage &&
+            Math.abs(activePlayer.centerPos.y - focusPlayer.centerPos.y) <= focusHalfHeight * coverage;
+        if (!near) return null;
+        const centerPos = new Vec2(
+            (activePlayer.centerPos.x + focusPlayer.centerPos.x) / 2,
+            (activePlayer.centerPos.y + focusPlayer.centerPos.y) / 2
+        );
+        const margin = Math.max(220, activeLargestCell.radius + focusLargestCell.radius);
+        const spanX = Math.abs(activePlayer.centerPos.x - focusPlayer.centerPos.x) + margin * 2;
+        const spanY = Math.abs(activePlayer.centerPos.y - focusPlayer.centerPos.y) + margin * 2;
+        const fitScaleX = baseWidth / Math.max(spanX, 1);
+        const fitScaleY = baseHeight / Math.max(spanY, 1);
+        const scale = Math.max(
+            minScale,
+            Math.min(activeScale, focusScale, fitScaleX, fitScaleY)
+        );
+        return { centerPos, scale };
+    }
+    updateSmartDualCameraLock(previousPlayer, nextPlayer) {
+        const controller = this.getLinkedController();
+        if (controller !== this) return controller.updateSmartDualCameraLock(previousPlayer, nextPlayer);
+        if (!controller.multiControl.smartDualCameraEnabled) {
+            controller.multiControl.viewLockPlayer = null;
+            return;
+        }
+        if (!previousPlayer || !nextPlayer || previousPlayer === nextPlayer) {
+            if (nextPlayer === controller.multiControl.viewLockPlayer) {
+                controller.multiControl.viewLockPlayer = null;
+            }
+            return;
+        }
+        const linkedPlayers = controller.getLinkedPlayers();
+        if (!linkedPlayers.includes(previousPlayer) || !linkedPlayers.includes(nextPlayer)) {
+            controller.multiControl.viewLockPlayer = null;
+            return;
+        }
+        if (nextPlayer === controller.multiControl.viewLockPlayer) {
+            controller.multiControl.viewLockPlayer = null;
+            return;
+        }
+        const previousLargest = controller.getLargestSelectableCell(previousPlayer);
+        const nextLargest = controller.getLargestSelectableCell(nextPlayer);
+        if (!previousLargest || !nextLargest || previousLargest.radius <= nextLargest.radius) {
+            controller.multiControl.viewLockPlayer = null;
+            return;
+        }
+        controller.multiControl.viewLockPlayer =
+            controller.isPlayerInViewOfPlayer(nextPlayer, previousPlayer) ? previousPlayer : null;
+    }
+    getViewPlayerForCamera() {
+        const controller = this.getLinkedController();
+        if (controller !== this) return controller.getViewPlayerForCamera();
+        const active = controller.getControlledPlayer();
+        if (!controller.multiControl.smartDualCameraEnabled) {
+            controller.multiControl.sharedCameraMode = false;
+            return active;
+        }
+        const largestLinked = controller.getLargestLinkedPlayer(active);
+        if (largestLinked && largestLinked !== active &&
+            controller.getSharedDualCameraView(active, largestLinked)) {
+            return largestLinked;
+        }
+        const locked = controller.multiControl.viewLockPlayer;
+        if (!locked || locked === active) return active;
+        if (locked.isRemoved || !sanitizePlayerCells(locked).length) {
+            controller.multiControl.viewLockPlayer = null;
+            return active;
+        }
+        if (!controller.getLinkedPlayers().includes(locked)) {
+            controller.multiControl.viewLockPlayer = null;
+            return active;
+        }
+        if (!controller.getSharedDualCameraView(active, locked)) {
+            controller.multiControl.viewLockPlayer = null;
+            return active;
+        }
+        return locked;
     }
     getSecondaryLinkedPlayer() {
         const controller = this.getLinkedController();
@@ -443,6 +599,7 @@ class Player {
             currentPlayer.mouse.assign(controller.inputMouse);
         }
         controller.multiControl.activePlayer = nextPlayer;
+        controller.updateSmartDualCameraLock(currentPlayer, nextPlayer);
         if (nextPlayer?.mouse && controller.inputMouse) {
             controller.inputMouse.assign(nextPlayer.mouse);
             if (nextPlayer === controller) {
@@ -524,6 +681,9 @@ class Player {
         this.multiControl = {
             enabled: false,
             activePlayer: this,
+            viewLockPlayer: null,
+            smartDualCameraEnabled: true,
+            sharedCameraMode: false,
             lastActionTick: 0,
             linkedPlayers: [this],
             pendingOwnedRefresh: false,
@@ -588,6 +748,9 @@ class Player {
         controller.multiControl = {
             enabled: false,
             activePlayer: controller,
+            viewLockPlayer: null,
+            smartDualCameraEnabled: true,
+            sharedCameraMode: false,
             lastActionTick: 0,
             linkedPlayers: [controller],
             pendingOwnedRefresh: false,
@@ -650,8 +813,15 @@ class Player {
         }
         this.sendDualControlState();
         this.sendMinimapHumans();
-        const focusPlayer = this.getControlledPlayer();
-        this.updateView(focusPlayer.cells.length);
+        const activePlayer = this.getControlledPlayer();
+        const viewPlayer = this.getViewPlayerForCamera();
+        this.updateView(viewPlayer, viewPlayer?.cells?.length || 0);
+        const sharedView = this.getSharedDualCameraView(activePlayer, viewPlayer);
+        this.multiControl.sharedCameraMode = !!sharedView;
+        if (sharedView) {
+            this.setCenterPos(sharedView.centerPos);
+            this._scale = sharedView.scale;
+        }
         const posPacket = new Packet.UpdatePosition(this, this.centerPos.x,
             this.centerPos.y, this._scale)
         this.socket.client.sendPacket(posPacket);
@@ -665,6 +835,19 @@ class Player {
         );
         // update visible nodes
         this.viewNodes = this.server.quadTree.allOverlapped(this.viewBox);
+        const linkedCells = [];
+        for (const linkedPlayer of this.getLinkedPlayers()) {
+            if (!linkedPlayer || linkedPlayer.isRemoved) continue;
+            linkedCells.push(...(linkedPlayer.getSelectableCells?.() || []));
+        }
+        if (linkedCells.length) {
+            const seenNodeIds = new Set(this.viewNodes.map((node) => node?.nodeId));
+            for (const cell of linkedCells) {
+                if (!cell || cell.isRemoved || seenNodeIds.has(cell.nodeId)) continue;
+                this.viewNodes.push(cell);
+                seenNodeIds.add(cell.nodeId);
+            }
+        }
         this.viewNodes.sort((a, b) => a.nodeId - b.nodeId);
     }
     isClientOwnedNode(node) {
@@ -758,8 +941,8 @@ class Player {
                 client.sendPacket(new Packet.UpdateLeaderboard(this.getControlledPlayer(), this.server.leaderboard, this.server.leaderboardType));
         }
     }
-    updateView(len) {
-        const focusPlayer = this.getControlledPlayer();
+    updateView(focusPlayer, len) {
+        if (!focusPlayer) focusPlayer = this.getControlledPlayer();
         if (focusPlayer.cells.length) { // in game
             this.centerPos = focusPlayer.centerPos.clone();
             this._scale = focusPlayer._scale;
