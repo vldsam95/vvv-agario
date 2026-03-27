@@ -1,6 +1,14 @@
 (function() {
     "use strict";
 
+    const DEFAULT_SKIN_PREVIEW_SRC = `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 120 120'>"
+        + "<rect width='120' height='120' rx='20' fill='#172234'/>"
+        + "<circle cx='60' cy='46' r='22' fill='#4cc9f0'/>"
+        + "<text x='60' y='94' font-size='18' text-anchor='middle' fill='#f4f7fb' font-family='Arial,sans-serif'>SKIN</text>"
+        + "</svg>"
+    )}`;
+
     function byId(id) {
         return document.getElementById(id);
     }
@@ -45,9 +53,10 @@
         const uploadPreview = byId("skin-preview");
         if (uploadPreview && skinInput) {
             const skinName = String(skinInput.value || "").trim();
-            uploadPreview.src = skinName ? `skins/${skinName}.png` : "skins/doge.png";
+            uploadPreview.src = skinName ? `skins/${skinName}.png` : DEFAULT_SKIN_PREVIEW_SRC;
             uploadPreview.onerror = () => {
-                uploadPreview.src = "skins/doge.png";
+                uploadPreview.onerror = null;
+                uploadPreview.src = DEFAULT_SKIN_PREVIEW_SRC;
             };
         }
     }

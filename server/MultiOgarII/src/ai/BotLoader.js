@@ -46,8 +46,14 @@ class BotLoader {
     }
     getTargetPopulation() {
         const settings = this.server.botSettings || {targetCount: 0, autoFill: false};
-        if (!settings.autoFill) return settings.targetCount | 0;
-        return Math.max(0, (settings.targetCount | 0) - this.getHumanCount());
+        const configuredTarget = settings.targetCount | 0;
+        const baseTarget = settings.autoFill
+            ? Math.max(0, configuredTarget - this.getHumanCount())
+            : configuredTarget;
+        const loadControl = this.server.getBotLoadControl?.();
+        const populationFactor = Number(loadControl?.populationFactor);
+        const factor = Number.isFinite(populationFactor) ? Math.max(0.35, Math.min(1, populationFactor)) : 1;
+        return Math.max(0, Math.round(baseTarget * factor));
     }
     pickProfile() {
         const settings = this.server.botSettings || {};

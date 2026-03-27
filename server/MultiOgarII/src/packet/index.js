@@ -8,6 +8,8 @@ module.exports = {
     UpdatePosition: require('./UpdatePosition'),
     ServerStat: require('./ServerStat'),
     SetBorder: require('./SetBorder'),
+    DualControlState: require('./DualControlState'),
+    MinimapHumans: require('./MinimapHumans'),
     UpdateNodes: require('./UpdateNodes'),
     UpdateLeaderboard: require('./UpdateLeaderboard'),
     LeaderboardPosition: require('./LeaderboardPosition'),

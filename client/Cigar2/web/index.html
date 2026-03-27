@@ -23,12 +23,19 @@
     <script src="assets/js/quadtree.js"></script>
     <script src="/runtime-config.js"></script>
     <script>
+        window.__AGAR_PAGE_LOAD_START = window.__AGAR_PAGE_LOAD_START || Date.now();
         (function() {
             var reportEndpoint = "/api/public/connection-report";
-            var reportVersion = "2026-03-loader-guard-v1";
+            var reportVersion = "2026-03-loader-guard-v3";
             var diagId = "diag-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
             var reportSent = {};
             var timeoutId = 0;
+            var primaryMainScriptUrl = "assets/js/game-client.js?v=20260327-tabfix-v2";
+            var fallbackMainScriptUrl = "assets/js/main_out.js?v=20260327-tabfix-v2";
+            var scriptStartCheckId = 0;
+            var mainScriptFailedUrls = [];
+            var fallbackScriptInjected = false;
+            var fetchedFallbackInjected = false;
 
             function sanitize(value, maxLength) {
                 return String(value || "").replace(/\s+/g, " ").trim().slice(0, maxLength || 200);
@@ -47,6 +54,81 @@
                 ];
                 if (extra) lines.push("details=" + sanitize(extra, 400));
                 return lines.join("\n");
+            }
+
+            function getClientSnapshot() {
+                var timezone = "";
+                try {
+                    timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "";
+                } catch (error) {
+                    timezone = "";
+                }
+                return {
+                    online: typeof navigator.onLine === "boolean" ? navigator.onLine : null,
+                    language: navigator.language || "",
+                    visibilityState: document.visibilityState || "",
+                    userAgent: navigator.userAgent || "",
+                    platform: navigator.userAgentData && navigator.userAgentData.platform
+                        ? navigator.userAgentData.platform
+                        : (navigator.platform || ""),
+                    timezone: timezone,
+                    hardwareConcurrency: Number.isFinite(navigator.hardwareConcurrency) ? Math.round(navigator.hardwareConcurrency) : 0,
+                    deviceMemoryGb: Number.isFinite(navigator.deviceMemory) ? Math.round(navigator.deviceMemory * 10) / 10 : 0,
+                    maxTouchPoints: Number.isFinite(navigator.maxTouchPoints) ? Math.round(navigator.maxTouchPoints) : 0,
+                    viewportWidth: typeof window.innerWidth === "number" ? Math.round(window.innerWidth) : 0,
+                    viewportHeight: typeof window.innerHeight === "number" ? Math.round(window.innerHeight) : 0,
+                    screenWidth: window.screen && Number.isFinite(window.screen.width) ? Math.round(window.screen.width) : 0,
+                    screenHeight: window.screen && Number.isFinite(window.screen.height) ? Math.round(window.screen.height) : 0,
+                    pixelRatio: Number.isFinite(window.devicePixelRatio) ? Math.round(window.devicePixelRatio * 100) / 100 : 0,
+                    reducedMotion: !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches),
+                    standalone: !!(window.matchMedia && window.matchMedia("(display-mode: standalone)").matches) || !!navigator.standalone
+                };
+            }
+
+            function getNetworkSnapshot() {
+                var connection = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+                return {
+                    effectiveType: sanitize(connection && connection.effectiveType, 24),
+                    connectionType: sanitize(connection && connection.type, 24),
+                    saveData: !!(connection && connection.saveData),
+                    rtt: Number.isFinite(connection && connection.rtt) ? Math.max(0, Math.round(connection.rtt)) : 0,
+                    downlinkMbps: Number.isFinite(connection && connection.downlink)
+                        ? Math.max(0, Math.round(connection.downlink * 100) / 100)
+                        : 0
+                };
+            }
+
+            function getPerformanceSnapshot() {
+                var pageAgeMs = Math.max(0, Date.now() - window.__AGAR_PAGE_LOAD_START);
+                var perf = {
+                    pageAgeMs: pageAgeMs,
+                    domInteractiveMs: 0,
+                    domContentLoadedMs: 0,
+                    loadEventMs: 0,
+                    wsInitMs: 0,
+                    wsOpenMs: 0,
+                    wsStableMs: 0,
+                    firstSpawnMs: 0,
+                    jsHeapUsedMb: 0
+                };
+                try {
+                    var nav = performance.getEntriesByType && performance.getEntriesByType("navigation");
+                    var entry = nav && nav[0];
+                    if (entry) {
+                        perf.domInteractiveMs = Math.max(0, Math.round(entry.domInteractive || 0));
+                        perf.domContentLoadedMs = Math.max(0, Math.round(entry.domContentLoadedEventEnd || entry.domContentLoadedEventStart || 0));
+                        perf.loadEventMs = Math.max(0, Math.round(entry.loadEventEnd || entry.loadEventStart || 0));
+                    } else if (performance.timing && performance.timing.navigationStart) {
+                        var timing = performance.timing;
+                        perf.domInteractiveMs = Math.max(0, timing.domInteractive - timing.navigationStart);
+                        perf.domContentLoadedMs = Math.max(0, (timing.domContentLoadedEventEnd || timing.domContentLoadedEventStart || 0) - timing.navigationStart);
+                        perf.loadEventMs = Math.max(0, (timing.loadEventEnd || timing.loadEventStart || 0) - timing.navigationStart);
+                    }
+                    if (performance.memory && Number.isFinite(performance.memory.usedJSHeapSize)) {
+                        perf.jsHeapUsedMb = Math.max(0, Math.round((performance.memory.usedJSHeapSize / (1024 * 1024)) * 100) / 100);
+                    }
+                } catch (error) {}
+                return perf;
             }
 
             function ensureUi(title, message, details) {
@@ -103,6 +185,9 @@
                 if (reportSent[stage]) return;
                 reportSent[stage] = true;
                 var detailsText = buildDetails(stage, title, message, extra);
+                var clientSnapshot = getClientSnapshot();
+                var networkSnapshot = getNetworkSnapshot();
+                var performanceSnapshot = getPerformanceSnapshot();
                 fetch(reportEndpoint, {
                     method: "POST",
                     cache: "no-store",
@@ -146,45 +231,235 @@
                             expiresAt: ""
                         },
                         client: {
-                            online: typeof navigator.onLine === "boolean" ? navigator.onLine : null,
-                            language: navigator.language || "",
-                            visibilityState: document.visibilityState || "",
-                            userAgent: navigator.userAgent || ""
+                            online: clientSnapshot.online,
+                            language: clientSnapshot.language,
+                            visibilityState: clientSnapshot.visibilityState,
+                            userAgent: clientSnapshot.userAgent,
+                            platform: clientSnapshot.platform,
+                            timezone: clientSnapshot.timezone,
+                            hardwareConcurrency: clientSnapshot.hardwareConcurrency,
+                            deviceMemoryGb: clientSnapshot.deviceMemoryGb,
+                            maxTouchPoints: clientSnapshot.maxTouchPoints,
+                            viewportWidth: clientSnapshot.viewportWidth,
+                            viewportHeight: clientSnapshot.viewportHeight,
+                            screenWidth: clientSnapshot.screenWidth,
+                            screenHeight: clientSnapshot.screenHeight,
+                            pixelRatio: clientSnapshot.pixelRatio,
+                            reducedMotion: clientSnapshot.reducedMotion,
+                            standalone: clientSnapshot.standalone
                         },
-                        network: {}
+                        network: networkSnapshot,
+                        performance: performanceSnapshot
                     })
                 }).catch(function() {});
                 ensureUi(title, message, detailsText);
             }
 
+            window.addEventListener("error", function(event) {
+                var target = event && event.target;
+                if (!target || target === window || target === document) {
+                    var errorFile = sanitize(event && event.filename, 260);
+                    var errorMessage = sanitize((event && (event.message || (event.error && event.error.message))) || "Unhandled client error", 220);
+                    if (!errorMessage) return;
+                    send(
+                        "window_runtime_error",
+                        "Unhandled client error",
+                        errorMessage,
+                        "error_file=" + (errorFile || "-")
+                            + " error_line=" + (event && Number.isFinite(event.lineno) ? event.lineno : 0)
+                            + " error_column=" + (event && Number.isFinite(event.colno) ? event.colno : 0)
+                    );
+                    return;
+                }
+                if (target.dataset && target.dataset.agarMainCandidate === "1") return;
+                var tagName = String(target.tagName || target.nodeName || "").toUpperCase();
+                var isCriticalResource = tagName === "SCRIPT"
+                    || (tagName === "LINK" && String(target.rel || "").toLowerCase().indexOf("stylesheet") !== -1);
+                if (!isCriticalResource) return;
+                var resourceUrlRaw = target.currentSrc || target.src || target.href || "";
+                if (!resourceUrlRaw) return;
+                var resourceUrl = sanitize(resourceUrlRaw, 260);
+                var resourceUrlLower = String(resourceUrlRaw).toLowerCase();
+                if (resourceUrlLower.indexOf("static.cloudflareinsights.com/") !== -1) return;
+                var resourceOrigin = "";
+                try {
+                    resourceOrigin = new URL(resourceUrlRaw, window.location.href).origin;
+                } catch (error) {
+                    resourceOrigin = "";
+                }
+                if (resourceOrigin && resourceOrigin !== window.location.origin) return;
+                send(
+                    "resource_load_error",
+                    "Client resource failed to load",
+                    "A required page resource failed to load.",
+                    "resource_tag=" + sanitize(target.tagName || target.nodeName || "resource", 24) + " resource_url=" + resourceUrl
+                );
+            }, true);
+
+            window.addEventListener("unhandledrejection", function(event) {
+                var reason = event && event.reason;
+                send(
+                    "window_unhandled_rejection",
+                    "Unhandled promise rejection",
+                    sanitize((reason && reason.message) || reason || "Unhandled promise rejection", 220)
+                );
+            });
+
             window.__AGAR_BOOT_GUARD = {
-                markMainLoaded: function() {
-                    window.__AGAR_MAIN_SCRIPT_LOADED = true;
+                clearScriptStartCheck: function() {
+                    if (scriptStartCheckId) {
+                        clearTimeout(scriptStartCheckId);
+                        scriptStartCheckId = 0;
+                    }
                 },
-                markMainFailed: function() {
-                    send("main_script_load_error", "Client script failed to load", "The main game client did not load. Hard refresh the page with Ctrl+F5 and try again.");
+                buildScriptCandidateDetails: function(extra) {
+                    var details = mainScriptFailedUrls.length
+                        ? "script_candidates=" + sanitize(mainScriptFailedUrls.join(","), 400)
+                        : "";
+                    if (extra) {
+                        details = details ? details + " " + sanitize(extra, 200) : sanitize(extra, 200);
+                    }
+                    return details;
+                },
+                markMainStarted: function(url) {
+                    window.__AGAR_MAIN_SCRIPT_STARTED = true;
+                    window.__AGAR_MAIN_SCRIPT_LOADING = false;
+                    if (url) window.__AGAR_MAIN_SCRIPT_URL = sanitize(url, 260);
+                    window.__AGAR_BOOT_GUARD.clearScriptStartCheck();
+                },
+                markMainResourceLoaded: function(url) {
+                    window.__AGAR_MAIN_SCRIPT_RESOURCE_LOADED = true;
+                    window.__AGAR_MAIN_SCRIPT_LOADING = false;
+                    window.__AGAR_MAIN_SCRIPT_URL = sanitize(url, 260);
+                },
+                markMainFailed: function(url) {
+                    if (url) mainScriptFailedUrls.push(sanitize(url, 260));
+                    window.__AGAR_MAIN_SCRIPT_LOADING = false;
+                    if (!fallbackScriptInjected && url === primaryMainScriptUrl) {
+                        window.__AGAR_BOOT_GUARD.loadFallbackScript("primary_script_error");
+                        return;
+                    }
+                    if (!fetchedFallbackInjected && url.indexOf(fallbackMainScriptUrl) === 0) {
+                        window.__AGAR_BOOT_GUARD.loadFetchedFallbackScript("fallback_script_error");
+                        return;
+                    }
+                    send(
+                        "main_script_load_error",
+                        "Client script failed to load",
+                        "The main game client did not load. Hard refresh the page with Ctrl+F5 and try again.",
+                        window.__AGAR_BOOT_GUARD.buildScriptCandidateDetails()
+                    );
                 },
                 markInitDone: function() {
                     window.__AGAR_MAIN_BOOT_OK = true;
                     if (timeoutId) clearTimeout(timeoutId);
+                    window.__AGAR_BOOT_GUARD.clearScriptStartCheck();
+                },
+                loadFetchedFallbackScript: function(reason) {
+                    if (fetchedFallbackInjected || window.__AGAR_MAIN_BOOT_OK || window.__AGAR_MAIN_SCRIPT_STARTED) return;
+                    fetchedFallbackInjected = true;
+                    window.__AGAR_MAIN_SCRIPT_LOADING = true;
+                    fetch(fallbackMainScriptUrl, {
+                        cache: "no-store",
+                        credentials: "same-origin"
+                    }).then(function(response) {
+                        if (!response.ok) throw new Error("http_" + response.status);
+                        return response.text();
+                    }).then(function(source) {
+                        if (window.__AGAR_MAIN_BOOT_OK || window.__AGAR_MAIN_SCRIPT_STARTED) return;
+                        if (!source || source.length < 1000) throw new Error("empty_script");
+                        var script = document.createElement("script");
+                        script.dataset.agarMainCandidate = "1";
+                        script.dataset.agarMainFallback = "fetch";
+                        script.text = source + "\n//# sourceURL=" + sanitize(fallbackMainScriptUrl.replace(/\?.*$/, "") + "#fetch-fallback", 260);
+                        (document.head || document.documentElement).appendChild(script);
+                        window.__AGAR_BOOT_GUARD.armScriptStartCheck("fetch_fallback_eval_timeout", fallbackMainScriptUrl + "#fetch");
+                    }).catch(function(error) {
+                        window.__AGAR_MAIN_SCRIPT_LOADING = false;
+                        mainScriptFailedUrls.push(sanitize(
+                            fallbackMainScriptUrl + "#fetch:" + ((error && error.message) ? error.message : "fetch_failed"),
+                            260
+                        ));
+                        send(
+                            "main_script_load_error",
+                            "Client script failed to load",
+                            "The main game client did not load. Hard refresh the page with Ctrl+F5 and try again.",
+                            window.__AGAR_BOOT_GUARD.buildScriptCandidateDetails("fallback_reason=" + sanitize(reason, 64))
+                        );
+                    });
+                },
+                loadFallbackScript: function(reason) {
+                    if (fallbackScriptInjected || window.__AGAR_MAIN_BOOT_OK || window.__AGAR_MAIN_SCRIPT_STARTED) return;
+                    window.__AGAR_MAIN_SCRIPT_LOADING = true;
+                    fallbackScriptInjected = true;
+                    var primaryScript = document.getElementById("agar-main-script");
+                    if (primaryScript && primaryScript.parentNode) {
+                        primaryScript.parentNode.removeChild(primaryScript);
+                    }
+                    var script = document.createElement("script");
+                    script.src = fallbackMainScriptUrl;
+                    script.async = false;
+                    script.dataset.agarMainCandidate = "1";
+                    script.dataset.agarMainFallback = "1";
+                    script.onload = function() {
+                        window.__AGAR_BOOT_GUARD.markMainResourceLoaded(fallbackMainScriptUrl);
+                    };
+                    script.onerror = function() {
+                        window.__AGAR_BOOT_GUARD.markMainFailed(fallbackMainScriptUrl + (reason ? "#" + reason : ""));
+                    };
+                    (document.head || document.documentElement).appendChild(script);
+                    window.__AGAR_BOOT_GUARD.armScriptStartCheck("fallback_script_timeout", fallbackMainScriptUrl);
+                },
+                armScriptStartCheck: function(reason, scriptUrl) {
+                    window.__AGAR_BOOT_GUARD.clearScriptStartCheck();
+                    scriptStartCheckId = window.setTimeout(function() {
+                        if (window.__AGAR_MAIN_SCRIPT_STARTED || window.__AGAR_MAIN_BOOT_OK) return;
+                        if (!fallbackScriptInjected) {
+                            window.__AGAR_BOOT_GUARD.loadFallbackScript(reason || "primary_script_timeout");
+                            return;
+                        }
+                        if (!fetchedFallbackInjected) {
+                            window.__AGAR_BOOT_GUARD.loadFetchedFallbackScript(reason || "fallback_script_timeout");
+                            return;
+                        }
+                        send(
+                            "main_script_load_error",
+                            "Client script failed to load",
+                            "The main game client did not load. Hard refresh the page with Ctrl+F5 and try again.",
+                            window.__AGAR_BOOT_GUARD.buildScriptCandidateDetails("script_start_timeout=" + sanitize(scriptUrl || "-", 260))
+                        );
+                    }, 6000);
                 },
                 armTimeout: function() {
                     if (timeoutId) clearTimeout(timeoutId);
-                    timeoutId = window.setTimeout(function() {
-                        if (window.__AGAR_MAIN_BOOT_OK) return;
-                        send(
-                            window.__AGAR_MAIN_SCRIPT_LOADED ? "main_boot_timeout" : "main_script_missing",
-                            "Client startup stalled",
-                            "The main game client did not finish loading. Hard refresh the page with Ctrl+F5 and try again."
-                        );
-                    }, 5000);
+                    var startTimeout = function() {
+                        timeoutId = window.setTimeout(function() {
+                            if (window.__AGAR_MAIN_BOOT_OK) return;
+                            send(
+                                (window.__AGAR_MAIN_SCRIPT_STARTED || window.__AGAR_MAIN_SCRIPT_RESOURCE_LOADED) ? "main_boot_timeout" : "main_script_missing",
+                                "Client startup stalled",
+                                "The main game client did not finish loading. Hard refresh the page with Ctrl+F5 and try again."
+                            );
+                        }, 12000);
+                    };
+                    if (document.readyState === "loading") {
+                        document.addEventListener("DOMContentLoaded", startTimeout, { once: true });
+                        return;
+                    }
+                    startTimeout();
                 }
             };
 
             window.__AGAR_BOOT_GUARD.armTimeout();
+            window.__AGAR_BOOT_GUARD.armScriptStartCheck("primary_script_timeout", primaryMainScriptUrl);
         })();
     </script>
-    <script src="assets/js/main_out.js?v=20260321-loaderguard2" onload="window.__AGAR_BOOT_GUARD && window.__AGAR_BOOT_GUARD.markMainLoaded()" onerror="window.__AGAR_BOOT_GUARD && window.__AGAR_BOOT_GUARD.markMainFailed()"></script>
+    <script id="agar-main-script"
+        defer
+        data-agar-main-candidate="1"
+        src="assets/js/game-client.js?v=20260327-tabfix-v2"
+        onload="window.__AGAR_BOOT_GUARD && window.__AGAR_BOOT_GUARD.markMainResourceLoaded(this.src)"
+        onerror="window.__AGAR_BOOT_GUARD && window.__AGAR_BOOT_GUARD.markMainFailed(this.src)"></script>
     <script defer src="assets/js/agarvvv-ui.js?v=20260312-skinslots"></script>
 </head>
 
@@ -261,7 +536,7 @@
                         </div>
                         <div class="skin-selection-tip">Main is your first cell. Multi is the extra avatar spawned with <b>Tab</b>.</div>
                         <select id="gamemode" class="form-control" onchange="setserver(this.value)" required>
-                            <option value="/ws" selected>Main Arena</option>
+                            <option value="/ws" selected>Loading arena...</option>
                         </select>
                     </div>
                     <div class="cta-row">
@@ -279,19 +554,19 @@
                     <div class="metric-grid">
                         <div class="metric-card">
                             <span class="metric-label">Humans</span>
-                            <strong id="runtime-humans">0</strong>
+                            <strong id="runtime-humans">...</strong>
                         </div>
                         <div class="metric-card">
                             <span class="metric-label">Bots</span>
-                            <strong id="runtime-bots">0</strong>
+                            <strong id="runtime-bots">...</strong>
                         </div>
                         <div class="metric-card">
                             <span class="metric-label">Leader</span>
-                            <strong id="runtime-leader">-</strong>
+                            <strong id="runtime-leader">...</strong>
                         </div>
                         <div class="metric-card">
                             <span class="metric-label">Update</span>
-                            <strong id="runtime-updated">-</strong>
+                            <strong id="runtime-updated">...</strong>
                         </div>
                     </div>
                     <ul class="hotkey-list">
@@ -319,7 +594,7 @@
                     </form>
                     <div id="skin-upload-status" class="upload-status">Upload a PNG, JPG or JPEG and it will be converted safely to a game-ready skin.</div>
                     <div class="skin-preview-card">
-                        <img id="skin-preview" src="skins/doge.png" alt="Skin preview">
+                        <img id="skin-preview" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 120 120'%3E%3Crect width='120' height='120' rx='20' fill='%23172234'/%3E%3Ccircle cx='60' cy='46' r='22' fill='%234cc9f0'/%3E%3Ctext x='60' y='94' font-size='18' text-anchor='middle' fill='%23f4f7fb' font-family='Arial,sans-serif'%3ESKIN%3C/text%3E%3C/svg%3E" alt="Skin preview">
                     </div>
                 </section>
             </div>
@@ -353,7 +628,7 @@
             </div>
 
             <div id="footer">
-                <span class="text-muted">Built for `agarvvv.greener-business.com`</span>
+                <span class="text-muted">Available on multiple arena domains</span>
             </div>
         </div>
     </div>
@@ -376,5 +651,57 @@
     <canvas id="canvas" width="800" height="600"></canvas>
     <input type="text" id="chat_textbox" placeholder="Press enter to chat" maxlength="200">
     <div style="font-family:'Ubuntu'">&nbsp;</div>
+    <script>
+        (function() {
+            function byId(id) {
+                return document.getElementById(id);
+            }
+
+            function applyRuntimeConfigFallback() {
+                var config = window.AGAR_CONFIG || {};
+                var select = byId("gamemode");
+                if (select && Array.isArray(config.servers) && config.servers.length) {
+                    select.innerHTML = "";
+                    config.servers.forEach(function(server) {
+                        var option = document.createElement("option");
+                        option.value = server.value;
+                        option.textContent = server.label;
+                        select.appendChild(option);
+                    });
+                }
+                var runtimeMode = byId("runtime-mode");
+                if (runtimeMode && config.activePresetLabel) {
+                    runtimeMode.textContent = config.activePresetLabel;
+                }
+            }
+
+            function applyPublicStateFallback(state) {
+                if (!state || typeof state !== "object") return;
+                var runtimeMode = byId("runtime-mode");
+                var humans = byId("runtime-humans");
+                var bots = byId("runtime-bots");
+                var leader = byId("runtime-leader");
+                var updated = byId("runtime-updated");
+                var badge = byId("server-status-badge");
+                if (runtimeMode && state.presetLabel) runtimeMode.textContent = state.presetLabel;
+                if (humans) humans.textContent = state.humans != null ? String(state.humans) : "...";
+                if (bots) bots.textContent = state.bots != null ? String(state.bots) : "...";
+                if (leader) leader.textContent = state.scoreLeader || "...";
+                if (updated) updated.textContent = state.averageUpdateMs != null ? String(state.averageUpdateMs) + " ms" : "...";
+                if (badge) badge.textContent = state.serverEnabled === false ? "Offline" : "Live";
+            }
+
+            applyRuntimeConfigFallback();
+            if (typeof fetch === "function") {
+                fetch("/api/public/state", {cache: "no-store"})
+                    .then(function(response) {
+                        if (!response.ok) throw new Error("state_fetch_failed");
+                        return response.json();
+                    })
+                    .then(applyPublicStateFallback)
+                    .catch(function() {});
+            }
+        })();
+    </script>
 </body>
 </html>

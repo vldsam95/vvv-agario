@@ -48,12 +48,30 @@ const VANILLA_PHYSICS_DEFAULTS = Object.freeze({
     borderHeight: 14142.135623730952,
 });
 
+const ASTR_PHYSICS_DEFAULTS = Object.freeze({
+    playerMaxCells: 16,
+    playerStartSize: 20,
+    playerSpeed: 0.82,
+    playerSpeedBase: 2.0,
+    playerSpeedExponent: -0.39,
+    splitVelocity: 660,
+    ejectVelocity: 640,
+    playerDecayRate: 0.0016,
+    playerRecombineTime: 36,
+    foodAmount: 900,
+    virusAmount: 65,
+    borderWidth: 14142.135623730952,
+    borderHeight: 14142.135623730952,
+});
+
 const SAFE_PRESET_CONFIG_KEYS = Object.freeze([
     "serverGamemode",
     "serverName",
     "serverRestart",
     "playerMaxCells",
     "playerSpeed",
+    "playerSpeedBase",
+    "playerSpeedExponent",
     "splitVelocity",
     "ejectVelocity",
     "playerDecayRate",
@@ -104,7 +122,7 @@ const DEFAULT_SERVER_SETTINGS = Object.freeze({
     serverScrambleLevel: 1,
     serverChat: 1,
     serverChatAscii: 0,
-    clientBind: "https://agarvvv.greener-business.com - http://agarvvv.greener-business.com - http://127.0.0.1:3100 - http://localhost:3100",
+    clientBind: "https://agarvvv.greener-business.com - http://agarvvv.greener-business.com - https://agarvvv.seo4starters.net - http://agarvvv.seo4starters.net - http://127.0.0.1:3100 - http://localhost:3100",
     allowSkinUpload: true,
     skinUploadMaxBytes: 314572,
     dualControlEnabled: true,
@@ -143,30 +161,13 @@ const DEFAULT_MODE_PRESETS = Object.freeze({
                 serverName: "AgarVVV FFA",
             }, INITIAL_PHYSICS_DEFAULTS),
         },
-        vanilla: {
-            label: "Vanilla Agar",
-            description: "Baseline Agar.io-style preset with vanilla-ish food and virus counts.",
+        astr: {
+            label: "ASTR",
+            description: "Cytos-inspired slow and smooth pacing with softer split/eject momentum.",
             config: Object.assign({
                 serverGamemode: 0,
-                serverName: "AgarVVV Vanilla",
-            }, VANILLA_PHYSICS_DEFAULTS),
-        },
-        agarx: {
-            label: "AGARX",
-            description: "Faster, denser preset designed around 32-way split play.",
-            config: {
-                serverGamemode: 4,
-                playerMaxCells: 32,
-                playerStartSize: 20,
-                playerSpeed: 1.08,
-                playerDecayRate: 0.0024,
-                playerRecombineTime: 24,
-                splitVelocity: 845,
-                ejectVelocity: 820,
-                foodAmount: 1100,
-                virusAmount: 80,
-                serverName: "AgarVVV AGARX",
-            },
+                serverName: "AgarVVV ASTR",
+            }, ASTR_PHYSICS_DEFAULTS),
         },
     },
 });
@@ -280,6 +281,12 @@ function sanitizeGameplayConfig(raw = {}, fallback = {}) {
                 break;
             case "playerSpeed":
                 config[key] = clampNumber(value, fallback[key] ?? INITIAL_PHYSICS_DEFAULTS.playerSpeed, 0.1, 4);
+                break;
+            case "playerSpeedBase":
+                config[key] = clampNumber(value, fallback[key] ?? baseConfig.playerSpeedBase, 0.1, 5);
+                break;
+            case "playerSpeedExponent":
+                config[key] = clampNumber(value, fallback[key] ?? baseConfig.playerSpeedExponent, -1.2, -0.1);
                 break;
             case "playerDecayRate":
                 config[key] = clampNumber(value, fallback[key] ?? INITIAL_PHYSICS_DEFAULTS.playerDecayRate, 0, 0.02);
@@ -399,7 +406,7 @@ function normalizeServerSettings(raw) {
     settings.serverScrambleLevel = clampNumber(settings.serverScrambleLevel, DEFAULT_SERVER_SETTINGS.serverScrambleLevel, 0, 3);
     settings.skinUploadMaxBytes = clampNumber(settings.skinUploadMaxBytes, DEFAULT_SERVER_SETTINGS.skinUploadMaxBytes, 65536, 1048576);
     settings.dualControlSwitchCooldown = clampNumber(settings.dualControlSwitchCooldown, DEFAULT_SERVER_SETTINGS.dualControlSwitchCooldown, 0, 100);
-    settings.multiControlMaxPilots = clampNumber(settings.multiControlMaxPilots, DEFAULT_SERVER_SETTINGS.multiControlMaxPilots, 1, 8);
+    settings.multiControlMaxPilots = 2;
     settings.serverName = sanitizeText(settings.serverName, DEFAULT_SERVER_SETTINGS.serverName, 60);
     settings.serverWelcome1 = typeof settings.serverWelcome1 === "string" ? settings.serverWelcome1.trim().slice(0, 120) : DEFAULT_SERVER_SETTINGS.serverWelcome1;
     settings.serverWelcome2 = typeof settings.serverWelcome2 === "string" ? settings.serverWelcome2.trim().slice(0, 120) : DEFAULT_SERVER_SETTINGS.serverWelcome2;
@@ -439,6 +446,8 @@ function normalizeServerSettings(raw) {
     settings.antiTeamVirusBurstMultiplier = clampNumber(settings.antiTeamVirusBurstMultiplier, DEFAULT_SERVER_SETTINGS.antiTeamVirusBurstMultiplier, 1, 5);
     settings.antiTeamVirusBurstThreshold = clampNumber(settings.antiTeamVirusBurstThreshold, DEFAULT_SERVER_SETTINGS.antiTeamVirusBurstThreshold, 1, 10);
     settings.antiTeamEjectWindowTicks = clampNumber(settings.antiTeamEjectWindowTicks, DEFAULT_SERVER_SETTINGS.antiTeamEjectWindowTicks, 1, 250);
+    delete settings.playerSpeedBase;
+    delete settings.playerSpeedExponent;
     return settings;
 }
 
@@ -520,6 +529,7 @@ module.exports = {
     PHYSICS_FIELDS,
     INITIAL_PHYSICS_DEFAULTS,
     VANILLA_PHYSICS_DEFAULTS,
+    ASTR_PHYSICS_DEFAULTS,
     SAFE_PRESET_CONFIG_KEYS,
     clone,
     readJson,

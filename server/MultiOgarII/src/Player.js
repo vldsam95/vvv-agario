@@ -3,6 +3,27 @@ const Vec2 = require('./modules/Vec2');
 const BinaryWriter = require("./packet/BinaryWriter");
 const {Quad} = require("./modules/QuadNode.js");
 const UserRoleEnum = require("./enum/UserRoleEnum");
+const DUAL_MAX_PLAYERS = 2;
+const MINIMAP_HUMANS_INTERVAL_TICKS = 8;
+
+function collectStableCellIds(player) {
+    return (player?.getSelectableCells?.() || [])
+        .map((cell) => cell?.nodeId >>> 0)
+        .filter((nodeId) => nodeId > 0)
+        .sort((left, right) => left - right);
+}
+
+function sanitizePlayerCells(player) {
+    if (!player) return [];
+    const rawCells = Array.isArray(player.cells) ? player.cells : [];
+    const cleanCells = rawCells.filter((cell) => cell && !cell.isRemoved);
+    if (cleanCells.length !== rawCells.length) {
+        player.cells = cleanCells;
+    } else if (!Array.isArray(player.cells)) {
+        player.cells = cleanCells;
+    }
+    return player.cells;
+}
 
 class Player {
     constructor(server, socket) {
@@ -29,6 +50,7 @@ class Player {
         this._scale = 1;
         this.borderCounter = 0;
         this.connectedTime = new Date();
+        this.lastSpawnTick = 0;
         this.tickLeaderboard = 0;
         this.team = 0;
         this.spectate = false;
@@ -65,6 +87,8 @@ class Player {
             lastActionTick: 0,
             linkedPlayers: [this],
             pendingOwnedRefresh: false,
+            lastDualStateSignature: "",
+            lastMinimapTick: 0,
         };
         // Gamemode function
         if (server) {
@@ -181,26 +205,43 @@ class Player {
         return linkedPlayers.filter(Boolean);
     }
     getLivingLinkedPlayers() {
-        return this.getLinkedPlayers().filter((player) => !player.isRemoved && player.cells.length);
+        return this.getLinkedPlayers().filter((player) => !player.isRemoved && sanitizePlayerCells(player).length);
     }
     hasAnyLinkedCells() {
-        return this.getLinkedPlayers().some((player) => player.cells.length);
+        return this.getLinkedPlayers().some((player) => sanitizePlayerCells(player).length);
     }
     pruneLinkedPlayers() {
         const controller = this.getLinkedController();
         if (controller !== this) return controller.pruneLinkedPlayers();
-        const survivors = [];
-        for (const player of controller.getLinkedPlayers()) {
-            if (player === controller || (!player.isRemoved && player.cells.length)) {
+        const survivors = [controller];
+        const seen = new Set([controller]);
+        const linkedPlayers = controller.multiControl?.linkedPlayers || [controller];
+        const disposeLinkedPlayer = (player) => {
+            if (!player || player === controller) return;
+            player.isRemoved = true;
+            player.clientNodes = [];
+            player.viewNodes = [];
+            player.cells = [];
+            player.linkedController = player;
+            player.isLinkedAvatar = false;
+        };
+        for (const player of linkedPlayers) {
+            if (!player || seen.has(player) || player === controller) continue;
+            seen.add(player);
+            const livingCells = sanitizePlayerCells(player);
+            if (!player.isRemoved && livingCells.length) {
                 survivors.push(player);
-            } else if (player !== controller) {
-                player.isRemoved = true;
-                player.clientNodes = [];
-                player.viewNodes = [];
-                player.cells = [];
+            } else {
+                disposeLinkedPlayer(player);
             }
         }
-        controller.multiControl.linkedPlayers = survivors.length ? survivors : [controller];
+        if (survivors.length > DUAL_MAX_PLAYERS) {
+            const overflow = survivors.splice(DUAL_MAX_PLAYERS);
+            for (const player of overflow) {
+                disposeLinkedPlayer(player);
+            }
+        }
+        controller.multiControl.linkedPlayers = survivors;
         controller.multiControl.enabled = controller.multiControl.linkedPlayers.length > 1;
         if (!controller.multiControl.linkedPlayers.includes(controller.multiControl.activePlayer)) {
             controller.multiControl.activePlayer =
@@ -213,15 +254,16 @@ class Player {
         if (controller !== this) return controller.syncLinkedPlayerState();
         controller.pruneLinkedPlayers();
         for (const player of controller.getLinkedPlayers()) {
-            if (!player.cells.length) {
+            const liveCells = sanitizePlayerCells(player);
+            if (!liveCells.length) {
                 player._score = 0;
                 player._scale = 1;
                 continue;
             }
-            const centerPos = player.cells.reduce(
+            const centerPos = liveCells.reduce(
                 (average, current) => average.add(current.position),
                 new Vec2(0, 0)
-            ).divide(player.cells.length);
+            ).divide(liveCells.length);
             player.setCenterPos(centerPos);
             player._scale = player.getLivingScale();
         }
@@ -263,11 +305,18 @@ class Player {
             lastActionTick: 0,
             linkedPlayers: [controller],
             pendingOwnedRefresh: false,
+            lastDualStateSignature: "",
+            lastMinimapTick: 0,
         };
     }
     attachLinkedPlayer(player) {
         const controller = this.getLinkedController();
         if (controller !== this) return controller.attachLinkedPlayer(player);
+        controller.pruneLinkedPlayers();
+        if (!player || controller.multiControl.linkedPlayers.length >= DUAL_MAX_PLAYERS) {
+            return null;
+        }
+        const avatarIndex = controller.multiControl.linkedPlayers.length;
         player.linkedController = controller;
         player.isLinkedAvatar = true;
         player.scrambleX = controller.scrambleX;
@@ -276,7 +325,7 @@ class Player {
         player.userAuth = controller.userAuth;
         player.userRole = controller.userRole;
         player.team = controller.team;
-        player.color = this.server.getLinkedAvatarColor(controller.color, controller.multiControl.linkedPlayers.length);
+        player.color = this.server.getLinkedAvatarColor(controller.color, avatarIndex);
         player.connectedTime = controller.connectedTime;
         player.mouse.assign(controller.inputMouse || controller.mouse);
         player.inputMouse.assign(controller.inputMouse || controller.mouse);
@@ -295,6 +344,61 @@ class Player {
     }
     getControlledCells() {
         return this.getControlledPlayer().getSelectableCells();
+    }
+    getSecondaryLinkedPlayer() {
+        const controller = this.getLinkedController();
+        if (controller !== this) return controller.getSecondaryLinkedPlayer();
+        controller.pruneLinkedPlayers();
+        for (const player of controller.getLinkedPlayers()) {
+            if (player !== controller) return player;
+        }
+        return null;
+    }
+    buildDualControlState() {
+        const controller = this.getLinkedController();
+        if (controller !== this) return controller.buildDualControlState();
+        controller.pruneLinkedPlayers();
+        const activePlayer = controller.getControlledPlayer();
+        const activeNodeIds = collectStableCellIds(activePlayer);
+        const inactiveNodeIds = [];
+        for (const player of controller.getLinkedPlayers()) {
+            if (!player || player === activePlayer) continue;
+            inactiveNodeIds.push(...collectStableCellIds(player));
+        }
+        inactiveNodeIds.sort((left, right) => left - right);
+        const enabled = inactiveNodeIds.length > 0;
+        return {
+            enabled,
+            activeNodeIds,
+            inactiveNodeIds,
+            signature: `${enabled ? 1 : 0}:${activeNodeIds.join(",")}|${inactiveNodeIds.join(",")}`,
+        };
+    }
+    sendDualControlState(force = false) {
+        const controller = this.getLinkedController();
+        if (controller !== this) return controller.sendDualControlState(force);
+        if (!controller.socket?.client?.protocol || !controller.socket.isConnected) return;
+        const state = controller.buildDualControlState();
+        if (!force && controller.multiControl.lastDualStateSignature === state.signature) return;
+        controller.multiControl.lastDualStateSignature = state.signature;
+        controller.socket.client.sendPacket(new Packet.DualControlState(
+            controller,
+            state.enabled,
+            state.activeNodeIds,
+            state.inactiveNodeIds
+        ));
+    }
+    sendMinimapHumans(force = false) {
+        const controller = this.getLinkedController();
+        if (controller !== this) return controller.sendMinimapHumans(force);
+        if (controller.isBot || controller.isMinion || controller.isMi || controller.isRestartOrphan) return;
+        if (!controller.socket?.client?.protocol || !controller.socket.isConnected) return;
+        if (!force && this.server.ticks - controller.multiControl.lastMinimapTick < MINIMAP_HUMANS_INTERVAL_TICKS) {
+            return;
+        }
+        controller.multiControl.lastMinimapTick = this.server.ticks;
+        const entries = this.server.getHumanMinimapEntries?.(controller) || [];
+        controller.socket.client.sendPacket(new Packet.MinimapHumans(controller, entries));
     }
     syncActiveMouse() {
         const controller = this.getLinkedController();
@@ -316,6 +420,8 @@ class Player {
             controller.socket.client.sendPacket(new Packet.AddNode(controller, cell));
         }
         controller.multiControl.pendingOwnedRefresh = false;
+        controller.multiControl.lastDualStateSignature = "";
+        controller.sendDualControlState(true);
     }
     notifyOwnedCellAdded(cell) {
         const controller = this.getLinkedController();
@@ -358,20 +464,34 @@ class Player {
             return;
         }
         controller.syncLinkedPlayerState();
-        const activePlayer = controller.getControlledPlayer();
-        if (!activePlayer.cells.length) return;
+        let activePlayer = controller.getControlledPlayer();
+        if (!sanitizePlayerCells(activePlayer).length) {
+            const fallback = controller.getLivingLinkedPlayers()[0];
+            if (!fallback) return;
+            controller.setActiveLinkedPlayer(fallback);
+            activePlayer = controller.getControlledPlayer();
+            if (!sanitizePlayerCells(activePlayer).length) return;
+        }
         controller.multiControl.lastActionTick = this.server.ticks;
-        const maxPilots = Math.max(1, this.server.config.multiControlMaxPilots || 2);
-        if (controller.getLivingLinkedPlayers().length < maxPilots) {
+        const primaryAlive = sanitizePlayerCells(controller).length > 0;
+        const secondary = controller.getSecondaryLinkedPlayer();
+        if (!secondary) {
             const avatar = this.server.spawnMultiControlAvatar(controller);
-            if (avatar) {
+            if (avatar && avatar !== controller) {
                 controller.setActiveLinkedPlayer(avatar);
+            }
+            return;
+        }
+        if (!primaryAlive) {
+            const respawned = this.server.spawnMultiControlAvatar(controller);
+            if (respawned === controller && sanitizePlayerCells(controller).length) {
+                controller.setActiveLinkedPlayer(controller);
                 return;
             }
         }
         const livingPlayers = controller.getLivingLinkedPlayers();
         if (livingPlayers.length < 2) return;
-        const currentIndex = Math.max(livingPlayers.indexOf(controller.getControlledPlayer()), 0);
+        const currentIndex = Math.max(livingPlayers.indexOf(activePlayer), 0);
         const nextPlayer = livingPlayers[(currentIndex + 1) % livingPlayers.length];
         controller.setActiveLinkedPlayer(nextPlayer);
     }
@@ -407,6 +527,8 @@ class Player {
             lastActionTick: 0,
             linkedPlayers: [this],
             pendingOwnedRefresh: false,
+            lastDualStateSignature: "",
+            lastMinimapTick: 0,
         };
         this.userAuth = sourcePlayer?.userAuth || null;
         this.userRole = sourcePlayer?.userRole || this.userRole;
@@ -469,6 +591,8 @@ class Player {
             lastActionTick: 0,
             linkedPlayers: [controller],
             pendingOwnedRefresh: false,
+            lastDualStateSignature: "",
+            lastMinimapTick: 0,
         };
         return true;
     }
@@ -524,6 +648,8 @@ class Player {
         if (this.multiControl.pendingOwnedRefresh) {
             this.refreshOwnedCells();
         }
+        this.sendDualControlState();
+        this.sendMinimapHumans();
         const focusPlayer = this.getControlledPlayer();
         this.updateView(focusPlayer.cells.length);
         const posPacket = new Packet.UpdatePosition(this, this.centerPos.x,

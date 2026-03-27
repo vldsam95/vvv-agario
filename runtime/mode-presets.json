@@ -8,6 +8,8 @@
         "serverName": "AgarVVV FFA",
         "playerMaxCells": 16,
         "playerSpeed": 1,
+        "playerSpeedBase": 2.2,
+        "playerSpeedExponent": -0.45,
         "splitVelocity": 780,
         "ejectVelocity": 780,
         "playerDecayRate": 0.002,
@@ -19,39 +21,22 @@
         "playerStartSize": 20
       }
     },
-    "vanilla": {
-      "label": "Vanilla Agar",
-      "description": "Agar-style baseline values with lighter food and virus density.",
+    "astr": {
+      "label": "ASTR",
+      "description": "Cytos-inspired slow and smooth pacing with softer split/eject momentum.",
       "config": {
         "serverGamemode": 0,
-        "serverName": "AgarVVV Vanilla",
+        "serverName": "AgarVVV ASTR",
         "playerMaxCells": 16,
-        "playerSpeed": 1,
-        "splitVelocity": 780,
-        "ejectVelocity": 780,
-        "playerDecayRate": 0.002,
-        "playerRecombineTime": 30,
-        "foodAmount": 700,
-        "virusAmount": 50,
-        "borderWidth": 14142.135623730952,
-        "borderHeight": 14142.135623730952,
-        "playerStartSize": 10
-      }
-    },
-    "agarx": {
-      "label": "AGARX",
-      "description": "Faster, denser preset designed around 32-way split play.",
-      "config": {
-        "serverGamemode": 4,
-        "serverName": "AgarVVV AGARX",
-        "playerMaxCells": 32,
-        "playerSpeed": 1.08,
-        "splitVelocity": 845,
-        "ejectVelocity": 820,
-        "playerDecayRate": 0.0024,
-        "playerRecombineTime": 24,
-        "foodAmount": 1100,
-        "virusAmount": 80,
+        "playerSpeed": 0.82,
+        "playerSpeedBase": 2,
+        "playerSpeedExponent": -0.39,
+        "splitVelocity": 660,
+        "ejectVelocity": 640,
+        "playerDecayRate": 0.0016,
+        "playerRecombineTime": 36,
+        "foodAmount": 900,
+        "virusAmount": 65,
         "borderWidth": 14142.135623730952,
         "borderHeight": 14142.135623730952,
         "playerStartSize": 20

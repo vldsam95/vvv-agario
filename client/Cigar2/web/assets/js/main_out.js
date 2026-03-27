@@ -1,7 +1,14 @@
 (function() {
     'use strict';
 
-    window.__AGAR_MAIN_SCRIPT_LOADED = true;
+    window.__AGAR_MAIN_SCRIPT_STARTED = true;
+    if (window.__AGAR_BOOT_GUARD && typeof window.__AGAR_BOOT_GUARD.markMainStarted === 'function') {
+        try {
+            window.__AGAR_BOOT_GUARD.markMainStarted(document.currentScript && document.currentScript.src
+                ? document.currentScript.src
+                : 'main_out.js');
+        } catch (error) {}
+    }
 
     if (typeof WebSocket === 'undefined' || typeof DataView === 'undefined' ||
         typeof ArrayBuffer === 'undefined' || typeof Uint8Array === 'undefined') {
@@ -39,7 +46,8 @@
         }
     }
 
-    const LOAD_START = Date.now();
+    const LOAD_START = window.__AGAR_PAGE_LOAD_START || Date.now();
+    window.__AGAR_PAGE_LOAD_START = LOAD_START;
 
     Array.prototype.remove = function (a) {
         const i = this.indexOf(a);
@@ -232,12 +240,18 @@
     const DEFAULT_CONNECTING_MESSAGE = 'Establishing a secure connection to the arena.';
     const CONNECTION_REPORT_VERSION = '2025-03-connection-diagnostics-v1';
     const CLIENT_BOOTSTRAP_REPORT_VERSION = '2026-03-client-bootstrap-v1';
+    const CLIENT_RUNTIME_REPORT_VERSION = '2026-03-client-runtime-v1';
     const WS_TICKET_TIMEOUT_MS = 12000;
     const WS_TICKET_REFRESH_BUFFER_MS = 5000;
     const WS_TICKET_RETRY_ATTEMPTS = 2;
     const WS_TICKET_RETRY_DELAY_MS = 1200;
     const RECONNECT_RECOVERY_DELAY_MS = 1800;
     const RECONNECT_RECOVERY_MAX_ATTEMPTS = 8;
+    const EARLY_ROUTE_FAILOVER_WINDOW_MS = 30000;
+    const SPAWNLESS_ROUTE_FAILOVER_WINDOW_MS = 180000;
+    const CLIENT_SUCCESS_SAMPLE_PERCENT = 8;
+    const MAX_RUNTIME_EVENT_REPORTS = 6;
+    const MAX_RESOURCE_ERROR_REPORTS = 4;
     const QUADTREE_MAX_POINTS = 32;
     const CELL_POINTS_MIN = 5;
     const CELL_POINTS_MAX = 120;
@@ -350,11 +364,135 @@
         const connection = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
         return {
             effectiveType: sanitizeDiagnosticValue(connection?.effectiveType, 24),
+            connectionType: sanitizeDiagnosticValue(connection?.type, 24),
+            saveData: !!connection?.saveData,
             rtt: Number.isFinite(connection?.rtt) ? Math.max(0, Math.round(connection.rtt)) : 0,
             downlinkMbps: Number.isFinite(connection?.downlink)
                 ? Math.max(0, Math.round(connection.downlink * 100) / 100)
                 : 0,
         };
+    }
+
+    function getClientEnvironmentSnapshot() {
+        let timezone = '';
+        try {
+            timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+        } catch (error) {
+            timezone = '';
+        }
+        const viewport = typeof window.innerWidth === 'number' && typeof window.innerHeight === 'number'
+            ? {width: Math.max(0, Math.round(window.innerWidth)), height: Math.max(0, Math.round(window.innerHeight))}
+            : {width: 0, height: 0};
+        const screenInfo = typeof window.screen === 'object' && window.screen
+            ? {
+                width: Math.max(0, Math.round(window.screen.width || 0)),
+                height: Math.max(0, Math.round(window.screen.height || 0)),
+            }
+            : {width: 0, height: 0};
+        return {
+            online: typeof navigator.onLine === 'boolean' ? navigator.onLine : null,
+            language: navigator.language || '',
+            visibilityState: document.visibilityState || '',
+            userAgent: navigator.userAgent || '',
+            platform: navigator.userAgentData?.platform || navigator.platform || '',
+            timezone,
+            hardwareConcurrency: Number.isFinite(navigator.hardwareConcurrency)
+                ? Math.max(0, Math.round(navigator.hardwareConcurrency))
+                : 0,
+            deviceMemoryGb: Number.isFinite(navigator.deviceMemory)
+                ? Math.max(0, Math.round(navigator.deviceMemory * 10) / 10)
+                : 0,
+            maxTouchPoints: Number.isFinite(navigator.maxTouchPoints)
+                ? Math.max(0, Math.round(navigator.maxTouchPoints))
+                : 0,
+            viewportWidth: viewport.width,
+            viewportHeight: viewport.height,
+            screenWidth: screenInfo.width,
+            screenHeight: screenInfo.height,
+            pixelRatio: Number.isFinite(window.devicePixelRatio)
+                ? Math.max(0, Math.round(window.devicePixelRatio * 100) / 100)
+                : 0,
+            reducedMotion: window.matchMedia
+                ? !!window.matchMedia('(prefers-reduced-motion: reduce)').matches
+                : false,
+            standalone: !!(window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) ||
+                !!navigator.standalone,
+        };
+    }
+
+    function getNavigationPerformanceSnapshot() {
+        const snapshot = {
+            domInteractiveMs: 0,
+            domContentLoadedMs: 0,
+            loadEventMs: 0,
+        };
+        try {
+            const entry = performance.getEntriesByType?.('navigation')?.[0];
+            if (entry) {
+                snapshot.domInteractiveMs = Math.max(0, Math.round(entry.domInteractive || 0));
+                snapshot.domContentLoadedMs = Math.max(
+                    0,
+                    Math.round(entry.domContentLoadedEventEnd || entry.domContentLoadedEventStart || 0)
+                );
+                snapshot.loadEventMs = Math.max(0, Math.round(entry.loadEventEnd || entry.loadEventStart || 0));
+                return snapshot;
+            }
+        } catch (error) {
+            Logger.warn(error);
+        }
+        const timing = performance.timing;
+        if (!timing || !timing.navigationStart) return snapshot;
+        snapshot.domInteractiveMs = Math.max(0, timing.domInteractive - timing.navigationStart);
+        snapshot.domContentLoadedMs = Math.max(
+            0,
+            (timing.domContentLoadedEventEnd || timing.domContentLoadedEventStart || 0) - timing.navigationStart
+        );
+        snapshot.loadEventMs = Math.max(0, (timing.loadEventEnd || timing.loadEventStart || 0) - timing.navigationStart);
+        return snapshot;
+    }
+
+    function getClientPerformanceSnapshot(diagnostic) {
+        const activeDiagnostic = diagnostic || activeConnectionDiagnostic || null;
+        const navigation = getNavigationPerformanceSnapshot();
+        const memory = performance.memory || {};
+        return {
+            pageAgeMs: Math.max(0, Date.now() - LOAD_START),
+            domInteractiveMs: navigation.domInteractiveMs,
+            domContentLoadedMs: navigation.domContentLoadedMs,
+            loadEventMs: navigation.loadEventMs,
+            wsInitMs: activeDiagnostic?.wsInitStartedAtMs ? Math.max(0, activeDiagnostic.wsInitStartedAtMs - LOAD_START) : 0,
+            wsOpenMs: activeDiagnostic?.wsOpenedAtMs ? Math.max(0, activeDiagnostic.wsOpenedAtMs - LOAD_START) : 0,
+            wsStableMs: activeDiagnostic?.wsStableAtMs ? Math.max(0, activeDiagnostic.wsStableAtMs - LOAD_START) : 0,
+            firstSpawnMs: activeDiagnostic?.firstSpawnAtMs ? Math.max(0, activeDiagnostic.firstSpawnAtMs - LOAD_START) : 0,
+            jsHeapUsedMb: Number.isFinite(memory.usedJSHeapSize)
+                ? Math.max(0, Math.round((memory.usedJSHeapSize / (1024 * 1024)) * 100) / 100)
+                : 0,
+        };
+    }
+
+    function hashDiagnosticText(text) {
+        const value = String(text || '');
+        let hash = 0;
+        for (let i = 0; i < value.length; i++) {
+            hash = (hash * 31 + value.charCodeAt(i)) >>> 0;
+        }
+        return hash >>> 0;
+    }
+
+    function shouldSampleSuccessfulSession() {
+        const source = wsResumeId || navigator.userAgent || window.location.host || 'agarvvv';
+        return (hashDiagnosticText(source) % 100) < CLIENT_SUCCESS_SAMPLE_PERCENT;
+    }
+
+    function normalizeResourceUrl(url) {
+        if (!url) return '';
+        try {
+            const resolved = new URL(String(url), window.location.href);
+            if (resolved.origin === window.location.origin) return `${resolved.pathname}${resolved.search}`;
+            return resolved.toString();
+        } catch (error) {
+            return sanitizeDiagnosticValue(url, 240);
+        }
     }
 
     function buildClientBootstrapDetails(state) {
@@ -397,6 +535,8 @@
         const diagId = state.diagId || createDiagnosticId();
         const detailsText = buildClientBootstrapDetails(Object.assign({}, state, {diagId}));
         const network = getClientNetworkSnapshot();
+        const client = getClientEnvironmentSnapshot();
+        const performanceSnapshot = getClientPerformanceSnapshot();
         return fetch(CONNECTION_REPORT_ENDPOINT, {
             method: 'POST',
             cache: 'no-store',
@@ -440,12 +580,25 @@
                     expiresAt: '',
                 },
                 client: {
-                    online: typeof navigator.onLine === 'boolean' ? navigator.onLine : null,
-                    language: navigator.language || '',
-                    visibilityState: document.visibilityState || '',
-                    userAgent: navigator.userAgent || '',
+                    online: client.online,
+                    language: client.language,
+                    visibilityState: client.visibilityState,
+                    userAgent: client.userAgent,
+                    platform: client.platform,
+                    timezone: client.timezone,
+                    hardwareConcurrency: client.hardwareConcurrency,
+                    deviceMemoryGb: client.deviceMemoryGb,
+                    maxTouchPoints: client.maxTouchPoints,
+                    viewportWidth: client.viewportWidth,
+                    viewportHeight: client.viewportHeight,
+                    screenWidth: client.screenWidth,
+                    screenHeight: client.screenHeight,
+                    pixelRatio: client.pixelRatio,
+                    reducedMotion: client.reducedMotion,
+                    standalone: client.standalone,
                 },
                 network,
+                performance: performanceSnapshot,
             }),
         }).catch((error) => {
             Logger.warn(error);
@@ -619,6 +772,10 @@
             ticketAttempts: 0,
             ticketTimeoutMs: 0,
             ticketExpiresAt: '',
+            wsInitStartedAtMs: 0,
+            wsOpenedAtMs: 0,
+            wsStableAtMs: 0,
+            firstSpawnAtMs: 0,
             wsOpened: false,
             wsStable: false,
             wsCloseCode: 0,
@@ -817,9 +974,47 @@
         return next;
     }
 
+    function flushPendingSpectateRequest() {
+        if (!pendingSpectateRequest || !ws || ws.readyState !== WebSocket.OPEN) return false;
+        wsSend(UINT8_CACHE[1]);
+        pendingSpectateRequest = false;
+        return true;
+    }
+
+    function resetDualControlVisualState() {
+        dualControlActive = false;
+        dualCellState.enabled = false;
+        dualCellState.activeIds.clear();
+        dualCellState.inactiveIds.clear();
+    }
+    function resetHumanMinimapState() {
+        minimapHumans.entries = [];
+        minimapHumans.updatedAt = 0;
+    }
+    function cancelNoCellsHomeOverlayCheck() {
+        if (!noCellsHomeOverlayTimer) return;
+        clearTimeout(noCellsHomeOverlayTimer);
+        noCellsHomeOverlayTimer = 0;
+    }
+    function scheduleNoCellsHomeOverlayCheck() {
+        if (connectionIntent !== 'play' || playOverlayDismissPending) return;
+        cancelNoCellsHomeOverlayCheck();
+        noCellsHomeOverlayTimer = window.setTimeout(() => {
+            noCellsHomeOverlayTimer = 0;
+            if (connectionIntent !== 'play' || playOverlayDismissPending) return;
+            if (cells.mine.length > 0) return;
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            resetDualControlVisualState();
+            showESCOverlay();
+        }, NO_CELLS_HOME_DELAY_MS);
+    }
+
     function wsCleanup() {
         if (!ws) return;
         Logger.debug('WebSocket cleanup');
+        resetDualControlVisualState();
+        resetHumanMinimapState();
+        cancelNoCellsHomeOverlayCheck();
         ws.onopen = null;
         ws.onmessage = null;
         ws.close();
@@ -843,6 +1038,10 @@
         connectionDiagnosticResetPending = false;
         updateConnectionDiagnostic({
             stage: 'opening_connection',
+            wsInitStartedAtMs: Date.now(),
+            wsOpenedAtMs: 0,
+            wsStableAtMs: 0,
+            firstSpawnAtMs: 0,
             wsOpened: false,
             wsStable: false,
             wsCloseCode: 0,
@@ -872,10 +1071,12 @@
     function wsOpen() {
         if (!ws) return;
         ws._agarOpened = true;
+        ws._agarOpenedAt = Date.now();
         reconnectDelay = 1000;
         clearConnectionNotice();
         updateConnectionDiagnostic({
             stage: 'authorizing',
+            wsOpenedAtMs: Date.now(),
             wsOpened: true,
             wsReadyState: ws.readyState,
         });
@@ -887,6 +1088,7 @@
         wsSend(SEND_254);
         wsSend(SEND_255);
         flushPendingPlayProfile();
+        flushPendingSpectateRequest();
     }
 
     function wsError(error) {
@@ -897,11 +1099,61 @@
         });
     }
 
+    function switchWsCandidate(reason, options = {}) {
+        if (wsCandidateIndex >= wsCandidates.length - 1) return false;
+        const previousIndex = wsCandidateIndex;
+        const nextIndex = previousIndex + 1;
+        const previousCandidate = wsCandidates[previousIndex] || wsUrl || FALLBACK_WS_URL;
+        const nextCandidate = wsCandidates[nextIndex] || previousCandidate;
+        wsCandidateIndex = nextIndex;
+        updateConnectionDiagnostic({
+            stage: 'route_failover',
+            title: 'Switching WebSocket route',
+            message: `Switching route after ${sanitizeDiagnosticValue(reason, 64)}.`,
+            candidate: sanitizeDiagnosticValue(nextCandidate, 200),
+            candidateIndex: nextIndex + 1,
+            candidateCount: wsCandidates.length,
+            final: false,
+        });
+        void sendRuntimeSignalReport({
+            stage: 'ws_route_failover',
+            severity: 'warning',
+            title: 'Client switched WebSocket route',
+            message: `Switching WS candidate ${previousIndex + 1}/${wsCandidates.length} to ${nextIndex + 1}/${wsCandidates.length}.`,
+            signature: `ws_route_failover|${previousIndex}|${nextIndex}|${sanitizeDiagnosticValue(reason, 64)}|${Number.isFinite(options.closeCode) ? options.closeCode : 0}|${connectionIntent}`,
+            extraLines: [
+                `route_reason=${sanitizeDiagnosticValue(reason, 64)}`,
+                `route_from=${sanitizeDiagnosticValue(previousCandidate, 200)}`,
+                `route_to=${sanitizeDiagnosticValue(nextCandidate, 200)}`,
+                `session_ms=${Number.isFinite(options.sessionDurationMs) ? Math.max(0, Math.round(options.sessionDurationMs)) : 0}`,
+                `had_owned_cells=${options.hadOwnedCells ? 'true' : 'false'}`,
+            ],
+        });
+        setConnectingStatus({
+            title: 'Switching Route',
+            message: 'Trying another secure path to the arena...',
+        });
+        byId('connecting').show(0.5);
+        const delayMs = Number.isFinite(options.delayMs) ? Math.max(0, Math.round(options.delayMs)) : 250;
+        window.setTimeout(() => wsInit(nextCandidate), delayMs);
+        return true;
+    }
+
     function wsClose(e) {
         if (e.currentTarget !== ws) return;
         const socketId = ws._agarId;
         const failedBeforeStable = !ws._agarStable;
         const hadOwnedCells = cells.mine.length > 0;
+        const sessionDurationMs = ws._agarOpenedAt ? Math.max(0, Date.now() - ws._agarOpenedAt) : 0;
+        const shortLivedRouteFailure = !failedBeforeStable
+            && sessionDurationMs > 0
+            && sessionDurationMs <= EARLY_ROUTE_FAILOVER_WINDOW_MS
+            && (e.code === 1006 || e.code === 1001);
+        const spawnlessRouteFailure = connectionIntent === 'play'
+            && !hadOwnedCells
+            && sessionDurationMs > 0
+            && sessionDurationMs <= SPAWNLESS_ROUTE_FAILOVER_WINDOW_MS
+            && (e.code === 1006 || e.code === 1001);
         const closeState = describeWsClose(e, failedBeforeStable);
         updateConnectionDiagnostic({
             stage: closeState.terminal ? 'terminal_close' : (failedBeforeStable ? 'connect_retry' : 'reconnect_retry'),
@@ -926,6 +1178,7 @@
             resetConnectingStatus();
             byId('connecting').hide();
             playOverlayDismissPending = false;
+            pendingSpectateRequest = false;
             reconnectRecoveryProfile = null;
             reconnectRecoveryAttempts = 0;
             showESCOverlay();
@@ -938,9 +1191,35 @@
         clearConnectionNotice();
         setConnectingStatus(closeState);
         byId('connecting').show(0.5);
-        if (failedBeforeStable && wsCandidateIndex < wsCandidates.length - 1) {
-            wsCandidateIndex += 1;
-            setTimeout(() => wsInit(wsCandidates[wsCandidateIndex]), 250);
+        if (connectionIntent === 'idle' || serverDisabled) {
+            resetConnectingStatus();
+            byId('connecting').hide();
+            playOverlayDismissPending = false;
+            pendingSpectateRequest = false;
+            reconnectRecoveryProfile = null;
+            reconnectRecoveryAttempts = 0;
+            showESCOverlay();
+            return;
+        }
+        if (failedBeforeStable && switchWsCandidate('failed_before_stable', {
+            closeCode: e.code,
+            sessionDurationMs,
+            hadOwnedCells,
+        })) {
+            return;
+        }
+        if (shortLivedRouteFailure && switchWsCandidate(hadOwnedCells ? 'short_lived_post_spawn' : 'short_lived_pre_spawn', {
+            closeCode: e.code,
+            sessionDurationMs,
+            hadOwnedCells,
+        })) {
+            return;
+        }
+        if (spawnlessRouteFailure && switchWsCandidate('spawn_timeout_no_cells', {
+            closeCode: e.code,
+            sessionDurationMs,
+            hadOwnedCells,
+        })) {
             return;
         }
         setTimeout(() => wsInit(wsCandidates[wsCandidateIndex] || wsUrl || FALLBACK_WS_URL), reconnectDelay);
@@ -1043,10 +1322,14 @@
                     cell.destroy(null);
                 }
                 cells.mine = [];
+                resetDualControlVisualState();
+                resetHumanMinimapState();
+                cancelNoCellsHomeOverlayCheck();
                 break;
             }
             case 0x14: { // clear my cells
                 cells.mine = [];
+                scheduleNoCellsHomeOverlayCheck();
                 break;
             }
             case 0x15: { // draw line
@@ -1055,6 +1338,7 @@
             }
             case 0x20: { // new cell
                 cells.mine.push(reader.getUint32());
+                cancelNoCellsHomeOverlayCheck();
                 finalizePendingSpawn();
                 break;
             }
@@ -1118,6 +1402,43 @@
                     wsSend(UINT8_CACHE[254]);
                     stats.pingLoopStamp = Date.now();
                 }, 2000);
+                break;
+            }
+            case 0x72: { // dual control state
+                const flags = reader.getUint8();
+                const nextActive = new Set();
+                const activeCount = reader.getUint16();
+                for (let i = 0; i < activeCount; i++) {
+                    nextActive.add(reader.getUint32());
+                }
+                const nextInactive = new Set();
+                const inactiveCount = reader.getUint16();
+                for (let i = 0; i < inactiveCount; i++) {
+                    nextInactive.add(reader.getUint32());
+                }
+                dualCellState.activeIds = nextActive;
+                dualCellState.inactiveIds = nextInactive;
+                dualCellState.enabled = !!(flags & 0x01) && nextInactive.size > 0;
+                dualControlActive = dualCellState.enabled;
+                break;
+            }
+            case 0x73: { // minimap humans
+                const count = reader.getUint16();
+                const entries = [];
+                for (let i = 0; i < count; i++) {
+                    const x = reader.getInt32();
+                    const y = reader.getInt32();
+                    const color = new Color(reader.getUint8(), reader.getUint8(), reader.getUint8());
+                    const flags = reader.getUint8();
+                    entries.push({
+                        x,
+                        y,
+                        color,
+                        mine: !!(flags & 0x01),
+                    });
+                }
+                minimapHumans.entries = entries;
+                minimapHumans.updatedAt = syncUpdStamp;
                 break;
             }
             case 0x63: { // chat message
@@ -1240,6 +1561,7 @@
             multiSkin: String(settings.multiSkin || '').trim(),
         };
         pendingPlayProfile = createPendingPlayProfile(nextProfile);
+        pendingSpectateRequest = false;
         reconnectRecoveryProfile = clonePlayProfile(nextProfile);
         if (!ws || ws.readyState !== WebSocket.OPEN || !ws._agarStable) {
             byId('connecting').show(0.5);
@@ -1294,6 +1616,18 @@
             });
             byId('connecting').show(0.5);
             flushPendingPlayProfile();
+            if (!cells.mine.length && reconnectRecoveryAttempts >= RECONNECT_RECOVERY_MAX_ATTEMPTS) {
+                const switched = switchWsCandidate('spawn_recovery_exhausted', {
+                    closeCode: 0,
+                    sessionDurationMs: ws && ws._agarOpenedAt ? Math.max(0, Date.now() - ws._agarOpenedAt) : 0,
+                    hadOwnedCells: false,
+                    delayMs: 120,
+                });
+                if (switched) {
+                    reconnectRecoveryAttempts = 0;
+                    return;
+                }
+            }
             scheduleReconnectRecovery();
         }, RECONNECT_RECOVERY_DELAY_MS);
     }
@@ -1310,6 +1644,7 @@
         cancelReconnectRecovery();
         reconnectRecoveryAttempts = 0;
         queuePlayProfile();
+        pumpSkinQueue();
         if (!ws || ws.readyState !== WebSocket.OPEN) {
             ensureWsConnection();
             return false;
@@ -1339,6 +1674,7 @@
     }
 
     function gameReset() {
+        cancelNoCellsHomeOverlayCheck();
         cleanupObject(cells);
         cleanupObject(border);
         cleanupObject(leaderboard);
@@ -1398,6 +1734,9 @@
 
     const knownSkins = new Map();
     const loadedSkins = new Map();
+    const queuedSkinLoads = [];
+    const queuedSkinLoadSet = new Set();
+    const loadingSkins = new Set();
     const galleryView = {
         page: 1,
         pageSize: 48,
@@ -1434,10 +1773,16 @@
     let activeConnectionDiagnostic = null;
     let activeConnectionNoticeState = null;
     let lastConnectionReportSignature = '';
+    let pendingConnectionReportSignature = '';
     let bootstrapFailureHandled = false;
     const bootstrapReportSignatures = new Set();
+    const runtimeReportSignatures = new Set();
     let connectionDiagnosticResetPending = true;
+    let runtimeEventReportCount = 0;
+    let resourceRuntimeReportCount = 0;
+    let clientSessionSampleSent = false;
     let pendingPlayProfile = null;
+    let pendingSpectateRequest = false;
     let playOverlayDismissPending = false;
     let reconnectRecoveryProfile = null;
     let reconnectRecoveryTimer = 0;
@@ -1446,6 +1791,8 @@
     let galleryTargetInputId = 'skin';
     let reconnectDelay = 1000;
     let serverDisabled = window.AGAR_CONFIG?.serverEnabled === false;
+    const NO_CELLS_HOME_DELAY_MS = 500;
+    let noCellsHomeOverlayTimer = 0;
 
     let syncUpdStamp = Date.now();
     let syncAppStamp = Date.now();
@@ -1459,6 +1806,19 @@
     let mapCenterSet = false;
     let minionControlled = false;
     let dualControlActive = false;
+    const dualCellState = {
+        enabled: false,
+        activeIds: new Set(),
+        inactiveIds: new Set(),
+    };
+    const minimapHumans = {
+        entries: [],
+        updatedAt: 0,
+    };
+    const dualBorderColors = {
+        active: '#2ce6ff',
+        inactive: '#ff7f50',
+    };
     let mouseX = NaN;
     let mouseY = NaN;
     let pointerSeenAt = 0;
@@ -1683,13 +2043,15 @@
             sanitizeDiagnosticValue(diagnostic.wsCloseReason, 120),
             diagnostic.ticketResult || '-',
         ].join('|');
-        if (lastConnectionReportSignature === signature) {
+        if (lastConnectionReportSignature === signature || pendingConnectionReportSignature === signature) {
             return Promise.resolve();
         }
-        lastConnectionReportSignature = signature;
+        pendingConnectionReportSignature = signature;
         diagnostic.reportStatus = 'sending';
         refreshVisibleConnectionNotice();
         const network = getClientNetworkSnapshot();
+        const client = getClientEnvironmentSnapshot();
+        const performanceSnapshot = getClientPerformanceSnapshot(diagnostic);
         return fetch(CONNECTION_REPORT_ENDPOINT, {
             method: 'POST',
             cache: 'no-store',
@@ -1733,12 +2095,25 @@
                     expiresAt: diagnostic.ticketExpiresAt,
                 },
                 client: {
-                    online: typeof navigator.onLine === 'boolean' ? navigator.onLine : null,
-                    language: navigator.language || '',
-                    visibilityState: document.visibilityState || '',
-                    userAgent: navigator.userAgent || '',
+                    online: client.online,
+                    language: client.language,
+                    visibilityState: client.visibilityState,
+                    userAgent: client.userAgent,
+                    platform: client.platform,
+                    timezone: client.timezone,
+                    hardwareConcurrency: client.hardwareConcurrency,
+                    deviceMemoryGb: client.deviceMemoryGb,
+                    maxTouchPoints: client.maxTouchPoints,
+                    viewportWidth: client.viewportWidth,
+                    viewportHeight: client.viewportHeight,
+                    screenWidth: client.screenWidth,
+                    screenHeight: client.screenHeight,
+                    pixelRatio: client.pixelRatio,
+                    reducedMotion: client.reducedMotion,
+                    standalone: client.standalone,
                 },
                 network,
+                performance: performanceSnapshot,
             }),
         }).then(async (response) => {
             let body = null;
@@ -1748,12 +2123,264 @@
                 body = null;
             }
             diagnostic.reportStatus = response.ok ? 'accepted' : `http_${response.status}`;
+            if (response.ok) {
+                lastConnectionReportSignature = signature;
+            }
             diagnostic.reportRequestId = sanitizeDiagnosticValue(body?.requestId, 128);
             refreshVisibleConnectionNotice();
         }).catch((error) => {
             Logger.warn(error);
             diagnostic.reportStatus = 'failed';
             refreshVisibleConnectionNotice();
+        }).finally(() => {
+            if (pendingConnectionReportSignature === signature) {
+                pendingConnectionReportSignature = '';
+            }
+        });
+    }
+
+    function buildRuntimeSignalDetails(state, diagnostic, extraLines) {
+        const lines = [
+            `diag_id=${sanitizeDiagnosticValue(diagnostic?.diagId || createDiagnosticId(), 64)}`,
+            `time_utc=${new Date().toISOString()}`,
+            `stage=${sanitizeDiagnosticValue(state?.stage || 'runtime_signal', 48)}`,
+            `severity=${sanitizeDiagnosticValue(state?.severity || 'warning', 24)}`,
+            `title=${sanitizeDiagnosticValue(state?.title || '-', 120)}`,
+            `message=${sanitizeDiagnosticValue(state?.message || '-', 220)}`,
+            `intent=${sanitizeDiagnosticValue(diagnostic?.connectionIntent || connectionIntent || '-', 24)}`,
+            `ws_target=${sanitizeDiagnosticValue(diagnostic?.target || summarizeWsTarget(wsUrl || FALLBACK_WS_URL), 200)}`,
+            `ws_candidate=${Number.isFinite(diagnostic?.candidateIndex) ? diagnostic.candidateIndex : 1}/${Number.isFinite(diagnostic?.candidateCount) ? diagnostic.candidateCount : 1}`,
+            `ws_opened=${diagnostic?.wsOpened ? 'true' : 'false'}`,
+            `ws_stable=${diagnostic?.wsStable ? 'true' : 'false'}`,
+            `ws_close_code=${Number.isFinite(diagnostic?.wsCloseCode) ? diagnostic.wsCloseCode : 0}`,
+            `network_online=${getOnlineStateText(typeof navigator.onLine === 'boolean' ? navigator.onLine : null)}`,
+            `visibility=${sanitizeDiagnosticValue(document.visibilityState || '-', 24)}`,
+            `resume_session=${shortenDiagnosticValue(diagnostic?.sessionId || wsResumeId)}`,
+        ];
+        for (const line of Array.isArray(extraLines) ? extraLines : []) {
+            if (!line) continue;
+            lines.push(sanitizeDiagnosticValue(line, 220));
+        }
+        return lines.join('\n');
+    }
+
+    function sendRuntimeSignalReport(options) {
+        if (!CONNECTION_REPORT_ENDPOINT || typeof fetch !== 'function' || !options) {
+            return Promise.resolve();
+        }
+        const diagnostic = ensureConnectionDiagnostic(wsUrl || FALLBACK_WS_URL);
+        const stage = sanitizeDiagnosticValue(options.stage || 'runtime_signal', 48);
+        const severity = sanitizeDiagnosticValue(options.severity || 'warning', 24);
+        const signature = sanitizeDiagnosticValue(
+            options.signature || [stage, options.title || '', options.message || '', options.signatureKey || ''].join('|'),
+            240
+        );
+        if (runtimeReportSignatures.has(signature)) {
+            return Promise.resolve();
+        }
+        if (options.resourceEvent) {
+            if (resourceRuntimeReportCount >= MAX_RESOURCE_ERROR_REPORTS) return Promise.resolve();
+            resourceRuntimeReportCount++;
+        } else if (!options.sampledSuccess) {
+            if (runtimeEventReportCount >= MAX_RUNTIME_EVENT_REPORTS) return Promise.resolve();
+            runtimeEventReportCount++;
+        }
+        runtimeReportSignatures.add(signature);
+        const title = sanitizeDiagnosticValue(options.title || 'Client runtime signal', 120);
+        const message = sanitizeDiagnosticValue(options.message || 'A client runtime signal was captured.', 240);
+        const client = getClientEnvironmentSnapshot();
+        const network = getClientNetworkSnapshot();
+        const performanceSnapshot = getClientPerformanceSnapshot(diagnostic);
+        const detailsText = buildRuntimeSignalDetails({
+            stage,
+            severity,
+            title,
+            message,
+        }, diagnostic, options.extraLines);
+        return fetch(CONNECTION_REPORT_ENDPOINT, {
+            method: 'POST',
+            cache: 'no-store',
+            credentials: 'same-origin',
+            keepalive: true,
+            headers: {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                diagId: diagnostic.diagId || createDiagnosticId(),
+                reportVersion: CLIENT_RUNTIME_REPORT_VERSION,
+                connectionIntent: diagnostic.connectionIntent || connectionIntent,
+                stage,
+                severity,
+                title,
+                message,
+                detailsText,
+                page: window.location.pathname,
+                sessionId: diagnostic.sessionId || wsResumeId,
+                ui: {
+                    status: title,
+                    visibleNotice: !!activeConnectionNoticeState,
+                },
+                ws: {
+                    target: diagnostic.target,
+                    candidate: diagnostic.candidate,
+                    closeCode: diagnostic.wsCloseCode,
+                    closeReason: diagnostic.wsCloseReason,
+                    opened: diagnostic.wsOpened,
+                    stable: diagnostic.wsStable,
+                    readyState: diagnostic.wsReadyState,
+                    candidateIndex: diagnostic.candidateIndex,
+                    candidateCount: diagnostic.candidateCount,
+                },
+                ticket: {
+                    requestId: diagnostic.ticketRequestId,
+                    result: diagnostic.ticketResult,
+                    attempts: diagnostic.ticketAttempts,
+                    timeoutMs: diagnostic.ticketTimeoutMs,
+                    expiresAt: diagnostic.ticketExpiresAt,
+                },
+                client: {
+                    online: client.online,
+                    language: client.language,
+                    visibilityState: client.visibilityState,
+                    userAgent: client.userAgent,
+                    platform: client.platform,
+                    timezone: client.timezone,
+                    hardwareConcurrency: client.hardwareConcurrency,
+                    deviceMemoryGb: client.deviceMemoryGb,
+                    maxTouchPoints: client.maxTouchPoints,
+                    viewportWidth: client.viewportWidth,
+                    viewportHeight: client.viewportHeight,
+                    screenWidth: client.screenWidth,
+                    screenHeight: client.screenHeight,
+                    pixelRatio: client.pixelRatio,
+                    reducedMotion: client.reducedMotion,
+                    standalone: client.standalone,
+                },
+                network,
+                performance: performanceSnapshot,
+            }),
+        }).catch((error) => {
+            Logger.warn(error);
+        });
+    }
+
+    function maybeSendClientSessionSample() {
+        if (clientSessionSampleSent || !shouldSampleSuccessfulSession()) return;
+        clientSessionSampleSent = true;
+        void sendRuntimeSignalReport({
+            stage: 'client_session_sample',
+            severity: 'info',
+            title: 'Sampled successful session',
+            message: 'Captured a sampled successful client session for diagnostics baselines.',
+            signature: `client_session_sample|${wsResumeId}`,
+            sampledSuccess: true,
+            extraLines: [
+                `sample_rate_percent=${CLIENT_SUCCESS_SAMPLE_PERCENT}`,
+                `owned_cells=${cells.mine.length}`,
+                `pointer_source=${sanitizeDiagnosticValue(pointerSource || '-', 48)}`,
+            ],
+        });
+    }
+
+    function handleResourceLoadRuntimeSignal(event) {
+        const target = event?.target;
+        if (!target || target === window || target === document) return;
+        const tagName = sanitizeDiagnosticValue(target.tagName || target.nodeName || 'resource', 24).toLowerCase();
+        const resourceUrl = normalizeResourceUrl(target.currentSrc || target.src || target.href || '');
+        if (!resourceUrl) return;
+        const resourceUrlLower = resourceUrl.toLowerCase();
+        if (resourceUrlLower.indexOf('static.cloudflareinsights.com/') !== -1) return;
+        let resourceOrigin = '';
+        try {
+            resourceOrigin = new URL(resourceUrl, window.location.href).origin;
+        } catch (error) {
+            resourceOrigin = '';
+        }
+        if (resourceOrigin && resourceOrigin !== window.location.origin) return;
+        const resourceRel = sanitizeDiagnosticValue(target.rel || '', 48);
+        const resourceType = sanitizeDiagnosticValue(target.type || '', 48);
+        void sendRuntimeSignalReport({
+            stage: 'resource_load_error',
+            severity: 'error',
+            title: 'Client resource failed to load',
+            message: `Failed to load ${tagName} resource.`,
+            signature: `resource_load_error|${tagName}|${resourceUrl}`,
+            resourceEvent: true,
+            extraLines: [
+                `resource_tag=${tagName}`,
+                `resource_url=${resourceUrl}`,
+                `resource_rel=${resourceRel || '-'}`,
+                `resource_type=${resourceType || '-'}`,
+            ],
+        });
+    }
+
+    function handleWindowRuntimeSignal(event) {
+        if (!event) return;
+        if (event.target && event.target !== window && event.target !== document) {
+            handleResourceLoadRuntimeSignal(event);
+            return;
+        }
+        const filename = normalizeResourceUrl(event.filename || '');
+        const errorMessage = sanitizeDiagnosticValue(event.message || event.error?.message || 'Unhandled client error', 220);
+        void sendRuntimeSignalReport({
+            stage: 'window_error',
+            severity: 'error',
+            title: 'Unhandled client error',
+            message: errorMessage,
+            signature: `window_error|${errorMessage}|${filename}|${event.lineno || 0}|${event.colno || 0}`,
+            extraLines: [
+                `error_name=${sanitizeDiagnosticValue(event.error?.name || 'Error', 80)}`,
+                `error_file=${filename || '-'}`,
+                `error_line=${Number.isFinite(event.lineno) ? event.lineno : 0}`,
+                `error_column=${Number.isFinite(event.colno) ? event.colno : 0}`,
+            ],
+        });
+    }
+
+    function handleUnhandledRejectionRuntimeSignal(event) {
+        const reason = event?.reason;
+        const errorMessage = sanitizeDiagnosticValue(reason?.message || reason || 'Unhandled promise rejection', 220);
+        void sendRuntimeSignalReport({
+            stage: 'unhandled_promise_rejection',
+            severity: 'error',
+            title: 'Unhandled promise rejection',
+            message: errorMessage,
+            signature: `unhandled_promise_rejection|${errorMessage}`,
+            extraLines: [
+                `reason_name=${sanitizeDiagnosticValue(reason?.name || 'PromiseRejection', 80)}`,
+                `reason_detail=${errorMessage}`,
+            ],
+        });
+    }
+
+    function handleConnectivityRuntimeSignal(stage, title, message) {
+        void sendRuntimeSignalReport({
+            stage,
+            severity: stage === 'network_offline' ? 'warning' : 'info',
+            title,
+            message,
+            signature: `${stage}|${getOnlineStateText(typeof navigator.onLine === 'boolean' ? navigator.onLine : null)}`,
+        });
+    }
+
+    function installRuntimeDiagnosticListeners() {
+        window.addEventListener('error', handleWindowRuntimeSignal, true);
+        window.addEventListener('unhandledrejection', handleUnhandledRejectionRuntimeSignal);
+        window.addEventListener('offline', () => {
+            handleConnectivityRuntimeSignal(
+                'network_offline',
+                'Browser reported offline',
+                'The browser reported that connectivity was lost.'
+            );
+        });
+        window.addEventListener('online', () => {
+            handleConnectivityRuntimeSignal(
+                'network_online_restored',
+                'Browser connectivity restored',
+                'The browser reported that connectivity was restored.'
+            );
         });
     }
 
@@ -1773,11 +2400,13 @@
         ws._agarStable = true;
         updateConnectionDiagnostic({
             stage: 'stable',
+            wsStableAtMs: Date.now(),
             wsOpened: true,
             wsStable: true,
             wsReadyState: ws.readyState,
             final: false,
         });
+        maybeSendClientSessionSample();
         sendCurrentMouseTarget();
         clearConnectionNotice();
         resetConnectingStatus();
@@ -1788,19 +2417,23 @@
             });
             byId('connecting').show(0.5);
             scheduleReconnectRecovery();
+            pumpSkinQueue();
             return;
         }
         byId('connecting').hide();
         cancelReconnectRecovery();
+        pumpSkinQueue();
     }
 
     function finalizePendingSpawn() {
+        cancelNoCellsHomeOverlayCheck();
         if (pendingPlayProfile && ws && pendingPlayProfile.sentSocketId === ws._agarId) {
             reconnectRecoveryProfile = clonePlayProfile(pendingPlayProfile);
             pendingPlayProfile = null;
         }
         updateConnectionDiagnostic({
             stage: 'spawned',
+            firstSpawnAtMs: ensureConnectionDiagnostic().firstSpawnAtMs || Date.now(),
             final: false,
         });
         sendCurrentMouseTarget();
@@ -1900,25 +2533,78 @@
     }
 
     function forgetBrokenSkin(skin) {
+        queuedSkinLoadSet.delete(skin);
+        loadingSkins.delete(skin);
         if (!skin || !knownSkins.has(skin)) return;
         knownSkins.delete(skin);
         loadedSkins.delete(skin);
         if (byId('gallery').style.display !== 'none') buildGallery();
     }
 
+    function canStartSkinLoads() {
+        return settings.showSkins !== false
+            && connectionIntent !== 'idle'
+            && document.visibilityState !== 'hidden';
+    }
+
+    function getSkinLoadConcurrency() {
+        const connection = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+        if (connection?.saveData) return 1;
+        const effectiveType = String(connection?.effectiveType || '').toLowerCase();
+        if (effectiveType === 'slow-2g' || effectiveType === '2g') return 1;
+        if (effectiveType === '3g') return 2;
+        return connectionIntent === 'play' ? 3 : 2;
+    }
+
+    function pumpSkinQueue() {
+        if (!canStartSkinLoads()) return;
+        while (loadingSkins.size < getSkinLoadConcurrency() && queuedSkinLoads.length) {
+            const nextSkin = queuedSkinLoads.shift();
+            queuedSkinLoadSet.delete(nextSkin);
+            if (!nextSkin || !knownSkins.has(nextSkin) || loadedSkins.has(nextSkin) || loadingSkins.has(nextSkin)) {
+                continue;
+            }
+            loadingSkins.add(nextSkin);
+            const skin = new Image();
+            skin.decoding = 'async';
+            skin.onload = () => {
+                loadingSkins.delete(nextSkin);
+                loadedSkins.set(nextSkin, skin);
+                pumpSkinQueue();
+            };
+            skin.onerror = () => {
+                loadingSkins.delete(nextSkin);
+                forgetBrokenSkin(nextSkin);
+                pumpSkinQueue();
+            };
+            skin.src = `${SKIN_URL}${nextSkin}.png`;
+        }
+    }
+
+    function queueSkinLoad(skin) {
+        if (!skin || !knownSkins.has(skin) || loadedSkins.has(skin) || loadingSkins.has(skin) || queuedSkinLoadSet.has(skin)) {
+            return;
+        }
+        queuedSkinLoadSet.add(skin);
+        queuedSkinLoads.push(skin);
+        pumpSkinQueue();
+    }
+
     function refreshSkinList() {
         return fetch(`skinList.txt?ts=${Date.now()}`, {cache: 'no-store'}).then(resp => resp.text()).then(data => {
-        const skins = data.split(',').filter(name => name.length > 0);
-        byId('gallery-btn').style.display = skins.length ? 'inline-block' : 'none';
-        const stamp = Date.now();
-        for (const skin of skins) knownSkins.set(skin, stamp);
-        for (const i of knownSkins.keys()) {
-            if (knownSkins.get(i) !== stamp) knownSkins.delete(i);
-        }
-        if (byId('gallery').style.display !== 'none') buildGallery();
+            const skins = data.split(',').filter(name => name.length > 0);
+            const galleryButton = byId('gallery-btn');
+            const gallery = byId('gallery');
+            if (galleryButton) galleryButton.style.display = skins.length ? 'inline-block' : 'none';
+            const stamp = Date.now();
+            for (const skin of skins) knownSkins.set(skin, stamp);
+            for (const i of knownSkins.keys()) {
+                if (knownSkins.get(i) !== stamp) knownSkins.delete(i);
+            }
+            if (gallery && gallery.style.display !== 'none') buildGallery();
+            pumpSkinQueue();
         });
     }
-    refreshSkinList();
     resetConnectingStatus();
     clearConnectionNotice();
 
@@ -1953,6 +2639,7 @@
             if (settings[id] !== '') elm[prop] = settings[id];
             elm.addEventListener('change', () => {
                 settings[id] = elm[prop];
+                if (id === 'showSkins') pumpSkinQueue();
             });
         }
         switch (elm.tagName.toLowerCase()) {
@@ -2278,6 +2965,26 @@
         mainCtx.fillRect(lightX, lightY, sectorWidth, sectorHeight);
         mainCtx.globalAlpha = 1;
 
+        if (syncAppStamp - minimapHumans.updatedAt > 6000 && minimapHumans.entries.length) {
+            minimapHumans.entries = [];
+        }
+        for (const marker of minimapHumans.entries) {
+            const x = beginX + Math.max(0, Math.min(border.width, marker.x - border.left)) * xScale;
+            const y = beginY + Math.max(0, Math.min(border.height, marker.y - border.top)) * yScale;
+            const radius = marker.mine ? 3.8 : 2.8;
+            mainCtx.fillStyle = marker.color.toHex();
+            mainCtx.beginPath();
+            mainCtx.arc(x, y, radius, 0, PI_2);
+            mainCtx.fill();
+            if (marker.mine) {
+                mainCtx.strokeStyle = '#ffffff';
+                mainCtx.lineWidth = 1.1;
+                mainCtx.beginPath();
+                mainCtx.arc(x, y, radius + 1.7, 0, PI_2);
+                mainCtx.stroke();
+            }
+        }
+
         mainCtx.beginPath();
         if (cells.mine.length) {
             for (const id of cells.mine) {
@@ -2420,6 +3127,9 @@
             mainCtx.fillText(text, mainCanvas.width / 2, 5);
             mainCtx.restore();
         }
+        if (cells.mine.length > 0) {
+            cancelNoCellsHomeOverlayCheck();
+        }
         if (dualControlActive && cells.mine.length > 0) {
             mainCtx.save();
             mainCtx.font = '18px Ubuntu';
@@ -2429,7 +3139,8 @@
             mainCtx.fillText('Multi-control active. Tab spawns or switches players, Shift+Tab returns to the primary player.', mainCanvas.width / 2, minionControlled ? 28 : 5);
             mainCtx.restore();
         } else if (cells.mine.length < 1) {
-            dualControlActive = false;
+            resetDualControlVisualState();
+            scheduleNoCellsHomeOverlayCheck();
         }
 
         cacheCleanup();
@@ -2525,7 +3236,9 @@
         }
         destroy(killerId) {
             cells.byId.delete(this.id);
-            if (cells.mine.remove(this.id) && cells.mine.length === 0) showESCOverlay();
+            if (cells.mine.remove(this.id) && cells.mine.length === 0) {
+                scheduleNoCellsHomeOverlayCheck();
+            }
             this.destroyed = true;
             this.dead = syncUpdStamp;
             if (killerId && !this.diedBy) {
@@ -2638,10 +3351,7 @@
             if (this.skin === null || !knownSkins.has(this.skin) || loadedSkins.has(this.skin)) {
                 return;
             }
-            const skin = new Image();
-            skin.onerror = () => forgetBrokenSkin(this.skin);
-            skin.src = `${SKIN_URL}${this.skin}.png`;
-            loadedSkins.set(this.skin, skin);
+            queueSkinLoad(this.skin);
         }
         setColor(value) {
             if (!value) {
@@ -2658,13 +3368,25 @@
             ctx.restore();
         }
         drawShape(ctx) {
+            const isDualActiveCell = dualCellState.activeIds.has(this.id);
+            const isDualInactiveCell = dualCellState.inactiveIds.has(this.id);
             ctx.fillStyle = settings.showColor ? this.color.toHex() : '#FFFFFF';
-            ctx.strokeStyle = settings.showColor ? this.sColor.toHex() : '#E5E5E5';
+            if (isDualActiveCell) {
+                ctx.strokeStyle = dualBorderColors.active;
+            } else if (isDualInactiveCell) {
+                ctx.strokeStyle = dualBorderColors.inactive;
+            } else {
+                ctx.strokeStyle = settings.showColor ? this.sColor.toHex() : '#E5E5E5';
+            }
             const skinImage = loadedSkins.get(this.skin);
             const hasSkin = settings.showSkins && this.skin && skinImage &&
                 skinImage.complete && skinImage.width && skinImage.height;
             const fullSkin = hasSkin && settings.fillSkin;
             ctx.lineWidth = Math.max(~~(this.s / 50), 10);
+            if (isDualActiveCell || isDualInactiveCell) {
+                const borderBoost = isDualActiveCell ? 1.35 : 1.15;
+                ctx.lineWidth = Math.max(8, ctx.lineWidth) * borderBoost;
+            }
             const drawRadius = this.s > 20 && !fullSkin
                 ? this.s - ctx.lineWidth / 2
                 : this.s;
@@ -2882,6 +3604,18 @@
     }
     function keydown(event) {
         const key = processKey(event);
+        if (key === 'tab') {
+            event.preventDefault();
+            if (event.repeat) return;
+            if (event.shiftKey) {
+                resetDualControlVisualState();
+                wsSend(UINT8_CACHE[27]);
+            } else {
+                dualControlActive = true;
+                wsSend(UINT8_CACHE[26]);
+            }
+            return;
+        }
         if (pressed[key]) return;
         if (Object.hasOwnProperty.call(pressed, key)) pressed[key] = true;
         if (key === 'enter') {
@@ -2895,16 +3629,6 @@
             }
         } else if (key === 'escape') {
             escOverlayShown ? hideESCOverlay() : showESCOverlay();
-        } else if (key === 'tab') {
-            event.preventDefault();
-            if (isTyping || escOverlayShown) return;
-            if (event.shiftKey) {
-                dualControlActive = false;
-                wsSend(UINT8_CACHE[27]);
-            } else {
-                dualControlActive = true;
-                wsSend(UINT8_CACHE[26]);
-            }
         } else {
             if (isTyping || escOverlayShown) return;
             let code = KEY_TO_OPCODE[key];
@@ -2934,6 +3658,14 @@
         if (Object.hasOwnProperty.call(pressed, key)) pressed[key] = false;
         if (key === 'w') clearInterval(macroIntervalID);
     }
+    function resetPressedKeys() {
+        for (const key in pressed) {
+            if (Object.hasOwnProperty.call(pressed, key)) {
+                pressed[key] = false;
+            }
+        }
+        clearInterval(macroIntervalID);
+    }
     function handleScroll(event) {
         if (event.target !== mainCanvas) return;
         camera.userZoom *= event.deltaY > 0 ? 0.8 : 1.2;
@@ -2950,6 +3682,9 @@
         setPlayButtonsDisabled(serverDisabled);
 
         loadSettings();
+        void refreshSkinList().catch((error) => {
+            Logger.warn(error);
+        });
         window.addEventListener('beforeunload', storeSettings);
         document.addEventListener('wheel', handleScroll, {passive: true});
         const capturePointerEvent = (event, source) => {
@@ -2972,8 +3707,14 @@
         window.addEventListener('focus', () => {
             sendCurrentMouseTarget();
         });
+        window.addEventListener('blur', resetPressedKeys);
         document.addEventListener('visibilitychange', () => {
-            if (document.visibilityState === 'visible') sendCurrentMouseTarget();
+            if (document.visibilityState === 'visible') {
+                sendCurrentMouseTarget();
+                pumpSkinQueue();
+            } else {
+                resetPressedKeys();
+            }
         });
         byId('play-btn').addEventListener('click', (event) => {
             updatePointerFromEvent(event, 'play_click');
@@ -3067,15 +3808,21 @@
         Logger.info(`Init done in ${Date.now() - LOAD_START}ms`);
     }
     window.setserver = (url) => {
+        const previousUrl = wsUrl;
         wsCandidates = buildServerCandidates(url);
         wsCandidateIndex = 0;
+        wsUrl = wsCandidates[0];
         connectionDiagnosticResetPending = true;
         if (serverDisabled) {
             byId('connecting').hide();
             return;
         }
         clearConnectionNotice();
-        if (wsCandidates[0] === wsUrl && ws && ws.readyState <= WebSocket.OPEN) return;
+        if (!ws || ws.readyState > WebSocket.OPEN || connectionIntent === 'idle') {
+            reconnectDelay = 1000;
+            return;
+        }
+        if (wsCandidates[0] === previousUrl && ws && ws.readyState <= WebSocket.OPEN) return;
         reconnectDelay = 1000;
         wsInit(wsCandidates[0]);
     };
@@ -3090,8 +3837,15 @@
         cancelReconnectRecovery();
         playOverlayDismissPending = false;
         pendingPlayProfile = null;
+        pendingSpectateRequest = true;
+        reconnectRecoveryProfile = null;
         reconnectRecoveryAttempts = 0;
-        wsSend(UINT8_CACHE[1]);
+        pumpSkinQueue();
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+            ensureWsConnection();
+        } else {
+            flushPendingSpectateRequest();
+        }
         stats.maxScore = 0;
         hideESCOverlay();
     };
@@ -3124,9 +3878,10 @@
         serverDisabled = !!disabled;
         setPlayButtonsDisabled(serverDisabled);
         if (serverDisabled) {
-            dualControlActive = false;
+            resetDualControlVisualState();
             playOverlayDismissPending = false;
             connectionIntent = 'idle';
+            pendingSpectateRequest = false;
             reconnectRecoveryProfile = null;
             cancelReconnectRecovery();
             reconnectRecoveryAttempts = 0;
@@ -3157,11 +3912,22 @@
         wsInit(wsCandidates[0]);
         return true;
     }
-    window.addEventListener('DOMContentLoaded', () => {
+    installRuntimeDiagnosticListeners();
+    let initBootstrapped = false;
+    function bootstrapInit(entryPoint) {
+        if (initBootstrapped) return;
+        initBootstrapped = true;
         try {
             init();
         } catch (error) {
-            handleBootstrapFailure(error, 'dom_content_loaded');
+            handleBootstrapFailure(error, entryPoint || 'bootstrap_init');
         }
-    });
+    }
+    if (document.readyState === 'loading') {
+        window.addEventListener('DOMContentLoaded', () => {
+            bootstrapInit('dom_content_loaded');
+        }, {once: true});
+    } else {
+        bootstrapInit('document_ready');
+    }
 })();

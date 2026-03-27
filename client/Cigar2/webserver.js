@@ -20,6 +20,25 @@ const PUBLIC_SKIN_UPLOAD_DAILY_LIMIT = 3;
 const WS_TICKET_PUBLIC_PATH = "/api/public/ws-ticket";
 const CONNECTION_REPORT_PUBLIC_PATH = "/api/public/connection-report";
 const WS_TICKET_SECRET = WsTicket.ensureSecret(runtimeStore.FILES.wsTicketSecret);
+const WEB_RUNTIME_SNAPSHOT_INTERVAL_MS = 15 * 60 * 1000;
+const GAME_INDEX_PATH = path.join(runtimeStore.WEB_DIR, "index.html");
+const GAME_MAIN_SCRIPT_PATH = path.join(runtimeStore.WEB_DIR, "assets", "js", "main_out.js");
+const GAME_QUADTREE_SCRIPT_PATH = path.join(runtimeStore.WEB_DIR, "assets", "js", "quadtree.js");
+const GAME_UI_SCRIPT_PATH = path.join(runtimeStore.WEB_DIR, "assets", "js", "agarvvv-ui.js");
+const EXTERNAL_MAIN_SCRIPT_TAG_PATTERN = /<script id="agar-main-script"[\s\S]*?<\/script>/;
+const EXTERNAL_QUADTREE_SCRIPT_TAG_PATTERN = /<script\s+src="assets\/js\/quadtree\.js"><\/script>/;
+const EXTERNAL_RUNTIME_CONFIG_TAG_PATTERN = /<script\s+src="\/runtime-config\.js"><\/script>/;
+const EXTERNAL_UI_SCRIPT_TAG_PATTERN = /<script\s+defer\s+src="assets\/js\/agarvvv-ui\.js\?[^"]*"><\/script>/;
+const PRIMARY_MAIN_SCRIPT_DECLARATION = 'var primaryMainScriptUrl = "assets/js/game-client.js?v=20260327-tabfix-v2";';
+const INLINE_PRIMARY_MAIN_SCRIPT_DECLARATION = 'var primaryMainScriptUrl = "inline:game-client?v=20260327-tabfix-v2-inline";';
+const INLINE_RUNTIME_CONFIG_PLACEHOLDER = "__AGAR_INLINE_RUNTIME_CONFIG__";
+const PRIMARY_PUBLIC_HOST = "agarvvv.greener-business.com";
+const LEGACY_PUBLIC_HOSTS = new Set([
+    "agarvvv.seo4starters.net",
+    "ws.agarvvv.seo4starters.net",
+]);
+const HOST_SPECIFIC_WS_OVERRIDES = {};
+let cachedGamePage = null;
 const upload = multer({
     storage: multer.memoryStorage(),
     limits: {
@@ -36,9 +55,28 @@ app.set("trust proxy", 1);
 app.use(helmet({
     contentSecurityPolicy: false,
     crossOriginResourcePolicy: false,
+    crossOriginOpenerPolicy: false,
+    originAgentCluster: false,
 }));
 app.use(express.json({limit: "1mb"}));
 app.use(express.urlencoded({extended: false}));
+app.use((req, res, next) => {
+    const host = getRequestHost(req);
+    if (!LEGACY_PUBLIC_HOSTS.has(host)) {
+        next();
+        return;
+    }
+    if (req.method !== "GET" && req.method !== "HEAD") {
+        next();
+        return;
+    }
+    if (req.path !== "/" && req.path !== "/play") {
+        next();
+        return;
+    }
+    const targetPath = req.originalUrl || req.url || req.path || "/";
+    res.redirect(302, `https://${PRIMARY_PUBLIC_HOST}${targetPath}`);
+});
 app.use((req, res, next) => {
     if (req.path === "/runtime-config.js" || req.path.startsWith("/api/")) {
         res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
@@ -96,12 +134,65 @@ function readRuntimeBundle() {
     };
 }
 
-function buildServerOptions(serverSettings, state, activePreset) {
+function getRequestHost(req) {
+    const host = typeof req?.headers?.host === "string" ? req.headers.host : "";
+    return host.split(":")[0].trim().toLowerCase();
+}
+
+function normalizeCountryCode(value) {
+    if (typeof value !== "string") return "";
+    const code = value.trim().toUpperCase();
+    return /^[A-Z]{2}$/.test(code) ? code : "";
+}
+
+function pushUniqueString(target, seen, value) {
+    const nextValue = typeof value === "string" ? value.trim() : "";
+    if (!nextValue || seen.has(nextValue)) return;
+    seen.add(nextValue);
+    target.push(nextValue);
+}
+
+function getWsEndpointConfig(req, serverSettings) {
+    const host = getRequestHost(req);
+    const defaultEndpoint = serverSettings.publicWsEndpoint || "/ws";
+    const override = HOST_SPECIFIC_WS_OVERRIDES[host];
+    const seen = new Set();
+    const candidates = [];
+    const push = (value) => pushUniqueString(candidates, seen, value);
+
+    if (!override) {
+        push(defaultEndpoint);
+        push("/ws");
+        return {
+            primaryValue: candidates[0] || defaultEndpoint || "/ws",
+            candidates: candidates.length ? candidates : ["/ws"],
+        };
+    }
+
+    const directEndpoint = override.primary || defaultEndpoint;
+    push(directEndpoint);
+    push("/ws");
+    for (const candidate of Array.isArray(override.extraCandidates) ? override.extraCandidates : []) {
+        push(candidate);
+    }
+    push(defaultEndpoint);
+    push("/ws");
+
+    return {
+        primaryValue: candidates[0] || directEndpoint || "/ws",
+        candidates: candidates.length ? candidates : ["/ws"],
+    };
+}
+
+function buildServerOptions(serverSettings, state, activePreset, req) {
     const entries = [];
     const seen = new Set();
-    const primaryValue = serverSettings.publicWsEndpoint || "/ws";
+    const wsConfig = getWsEndpointConfig(req, serverSettings);
+    const primaryValue = wsConfig.primaryValue;
     const primaryLabel = state.presetLabel || activePreset?.label || serverSettings.serverName || "Arena";
-    const fallbackLabel = primaryValue === "/ws" ? primaryLabel : "Direct /ws Fallback";
+    const directLabel = "Direct WS Route";
+    const proxiedLabel = "Cloudflare WS Route";
+    const legacyLabel = "Legacy WS Fallback";
 
     function push(label, value) {
         const nextValue = typeof value === "string" ? value.trim() : "";
@@ -111,7 +202,12 @@ function buildServerOptions(serverSettings, state, activePreset) {
     }
 
     push(primaryLabel, primaryValue);
-    push(fallbackLabel, "/ws");
+    for (const candidate of wsConfig.candidates) {
+        if (candidate === primaryValue) continue;
+        if (candidate === "/ws") push(proxiedLabel, candidate);
+        else if (candidate === "wss://agarvvv.greener-business.com/ws") push(legacyLabel, candidate);
+        else push(directLabel, candidate);
+    }
     return entries;
 }
 
@@ -247,7 +343,100 @@ function setNoStoreHeaders(res) {
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
     res.setHeader("Pragma", "no-cache");
     res.setHeader("Expires", "0");
-    res.setHeader("Clear-Site-Data", "\"cache\"");
+}
+
+function escapeInlineScriptSource(source) {
+    return String(source || "").replace(/<\/script/gi, "<\\/script");
+}
+
+function buildInlineScriptTag(source, options = {}) {
+    const attributes = [];
+    if (options.id) attributes.push(`id="${options.id}"`);
+    if (options.attributes) attributes.push(options.attributes.trim());
+    const openingTag = attributes.length ? `<script ${attributes.join(" ")}>` : "<script>";
+    const footer = options.sourceUrl ? `\n//# sourceURL=${options.sourceUrl}` : "";
+    return `${openingTag}\n${escapeInlineScriptSource(source)}${footer}\n</script>`;
+}
+
+function buildInlineMainScriptTag(source) {
+    return buildInlineScriptTag(source, {
+        id: "agar-main-script",
+        attributes: 'data-agar-main-candidate="1" data-agar-main-inline="1"',
+        sourceUrl: "assets/js/game-client.inline.js?v=20260327-tabfix-v2-inline",
+    });
+}
+
+function buildInlineRuntimeConfigTag(req) {
+    return buildInlineScriptTag(
+        `window.AGAR_CONFIG = ${JSON.stringify(buildRuntimeConfig(req), null, 2)};`,
+        {
+            id: "agar-runtime-config",
+            sourceUrl: "runtime-config.inline.js?v=20260322-inline-v1",
+        }
+    );
+}
+
+function buildInlineQuadtreeScriptTag(source) {
+    return buildInlineScriptTag(source, {
+        id: "agar-quadtree-script",
+        sourceUrl: "assets/js/quadtree.inline.js?v=20260322-inline-v1",
+    });
+}
+
+function buildInlineUiScriptTag(source) {
+    return buildInlineScriptTag(source, {
+        id: "agar-ui-script",
+        sourceUrl: "assets/js/agarvvv-ui.inline.js?v=20260322-inline-v1",
+    });
+}
+
+function getRenderedGameIndex(req) {
+    const indexStat = fs.statSync(GAME_INDEX_PATH);
+    const mainStat = fs.statSync(GAME_MAIN_SCRIPT_PATH);
+    const quadtreeStat = fs.statSync(GAME_QUADTREE_SCRIPT_PATH);
+    const uiStat = fs.statSync(GAME_UI_SCRIPT_PATH);
+    const cacheKey = [
+        indexStat.size,
+        indexStat.mtimeMs,
+        mainStat.size,
+        mainStat.mtimeMs,
+        quadtreeStat.size,
+        quadtreeStat.mtimeMs,
+        uiStat.size,
+        uiStat.mtimeMs,
+    ].join(":");
+    if (cachedGamePage && cachedGamePage.cacheKey === cacheKey) {
+        return cachedGamePage.html.replace(INLINE_RUNTIME_CONFIG_PLACEHOLDER, buildInlineRuntimeConfigTag(req));
+    }
+
+    let html = fs.readFileSync(GAME_INDEX_PATH, "utf8");
+    const mainSource = fs.readFileSync(GAME_MAIN_SCRIPT_PATH, "utf8");
+    const quadtreeSource = fs.readFileSync(GAME_QUADTREE_SCRIPT_PATH, "utf8");
+    const uiSource = fs.readFileSync(GAME_UI_SCRIPT_PATH, "utf8");
+    if (html.includes(PRIMARY_MAIN_SCRIPT_DECLARATION)) {
+        html = html.replace(PRIMARY_MAIN_SCRIPT_DECLARATION, INLINE_PRIMARY_MAIN_SCRIPT_DECLARATION);
+    }
+    if (!EXTERNAL_QUADTREE_SCRIPT_TAG_PATTERN.test(html)) {
+        throw new Error("game_quadtree_script_tag_missing");
+    }
+    html = html.replace(EXTERNAL_QUADTREE_SCRIPT_TAG_PATTERN, buildInlineQuadtreeScriptTag(quadtreeSource));
+    if (!EXTERNAL_RUNTIME_CONFIG_TAG_PATTERN.test(html)) {
+        throw new Error("runtime_config_script_tag_missing");
+    }
+    html = html.replace(EXTERNAL_RUNTIME_CONFIG_TAG_PATTERN, INLINE_RUNTIME_CONFIG_PLACEHOLDER);
+    if (!EXTERNAL_MAIN_SCRIPT_TAG_PATTERN.test(html)) {
+        throw new Error("game_main_script_tag_missing");
+    }
+    html = html.replace(EXTERNAL_MAIN_SCRIPT_TAG_PATTERN, buildInlineMainScriptTag(mainSource));
+    if (!EXTERNAL_UI_SCRIPT_TAG_PATTERN.test(html)) {
+        throw new Error("game_ui_script_tag_missing");
+    }
+    html = html.replace(EXTERNAL_UI_SCRIPT_TAG_PATTERN, buildInlineUiScriptTag(uiSource));
+    cachedGamePage = {
+        cacheKey,
+        html,
+    };
+    return html.replace(INLINE_RUNTIME_CONFIG_PLACEHOLDER, buildInlineRuntimeConfigTag(req));
 }
 
 function isConnectionDiagnosticPath(pathname) {
@@ -262,6 +451,14 @@ function isConnectionDiagnosticPath(pathname) {
 function sanitizeBoolean(value) {
     if (value === true || value === false) return value;
     return undefined;
+}
+
+function sanitizeDecimal(value, min = 0, max = Number.MAX_SAFE_INTEGER, decimals = 2) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return undefined;
+    const clamped = Math.max(min, Math.min(max, number));
+    const factor = Math.pow(10, Math.max(0, decimals));
+    return Math.round(clamped * factor) / factor;
 }
 
 function sanitizePublicConnectionReport(req) {
@@ -309,13 +506,38 @@ function sanitizePublicConnectionReport(req) {
             language: ConnectionDiagnostics.sanitizeText(client.language, 32),
             visibilityState: ConnectionDiagnostics.sanitizeText(client.visibilityState, 24),
             userAgent: ConnectionDiagnostics.sanitizeText(client.userAgent || req.headers["user-agent"], 240),
+            platform: ConnectionDiagnostics.sanitizeText(client.platform, 48),
+            timezone: ConnectionDiagnostics.sanitizeText(client.timezone, 64),
+            hardwareConcurrency: ConnectionDiagnostics.sanitizeInteger(client.hardwareConcurrency, 0, 1024),
+            deviceMemoryGb: sanitizeDecimal(client.deviceMemoryGb, 0, 1024),
+            maxTouchPoints: ConnectionDiagnostics.sanitizeInteger(client.maxTouchPoints, 0, 64),
+            viewportWidth: ConnectionDiagnostics.sanitizeInteger(client.viewportWidth, 0, 20000),
+            viewportHeight: ConnectionDiagnostics.sanitizeInteger(client.viewportHeight, 0, 20000),
+            screenWidth: ConnectionDiagnostics.sanitizeInteger(client.screenWidth, 0, 20000),
+            screenHeight: ConnectionDiagnostics.sanitizeInteger(client.screenHeight, 0, 20000),
+            pixelRatio: sanitizeDecimal(client.pixelRatio, 0, 20),
+            reducedMotion: sanitizeBoolean(client.reducedMotion),
+            standalone: sanitizeBoolean(client.standalone),
         },
         network: {
             effectiveType: ConnectionDiagnostics.sanitizeText(network.effectiveType, 24),
+            connectionType: ConnectionDiagnostics.sanitizeText(network.connectionType, 24),
+            saveData: sanitizeBoolean(network.saveData),
             rtt: ConnectionDiagnostics.sanitizeInteger(network.rtt, 0, 60000),
             downlinkMbps: Number.isFinite(Number(network.downlinkMbps))
                 ? Math.max(0, Math.min(10000, Number(network.downlinkMbps)))
                 : undefined,
+        },
+        performance: {
+            pageAgeMs: ConnectionDiagnostics.sanitizeInteger(body.performance?.pageAgeMs, 0, 86400000),
+            domInteractiveMs: ConnectionDiagnostics.sanitizeInteger(body.performance?.domInteractiveMs, 0, 86400000),
+            domContentLoadedMs: ConnectionDiagnostics.sanitizeInteger(body.performance?.domContentLoadedMs, 0, 86400000),
+            loadEventMs: ConnectionDiagnostics.sanitizeInteger(body.performance?.loadEventMs, 0, 86400000),
+            wsInitMs: ConnectionDiagnostics.sanitizeInteger(body.performance?.wsInitMs, 0, 86400000),
+            wsOpenMs: ConnectionDiagnostics.sanitizeInteger(body.performance?.wsOpenMs, 0, 86400000),
+            wsStableMs: ConnectionDiagnostics.sanitizeInteger(body.performance?.wsStableMs, 0, 86400000),
+            firstSpawnMs: ConnectionDiagnostics.sanitizeInteger(body.performance?.firstSpawnMs, 0, 86400000),
+            jsHeapUsedMb: sanitizeDecimal(body.performance?.jsHeapUsedMb, 0, 1024 * 1024),
         },
     };
 }
@@ -376,8 +598,9 @@ function buildRuntimeConfig(req) {
     const serverSettings = bundle.serverSettings || {};
     const state = bundle.serverState || {};
     const activePreset = bundle.modePresets.presets?.[serverSettings.activePreset] || null;
+    const wsConfig = getWsEndpointConfig(req, serverSettings);
     return {
-        defaultWsEndpoint: serverSettings.publicWsEndpoint || "/ws",
+        defaultWsEndpoint: wsConfig.primaryValue,
         publicTitle: serverSettings.publicTitle || serverSettings.serverName || "AgarVVV Arena",
         publicSubtitle: serverSettings.publicSubtitle || "Custom MultiOgar server",
         allowSkinUpload: !!serverSettings.allowSkinUpload,
@@ -390,7 +613,7 @@ function buildRuntimeConfig(req) {
         wsTicketEndpoint: WS_TICKET_PUBLIC_PATH,
         connectionReportEndpoint: CONNECTION_REPORT_PUBLIC_PATH,
         activePresetLabel: state.presetLabel || activePreset?.label || "Arena",
-        servers: buildServerOptions(serverSettings, state, activePreset),
+        servers: buildServerOptions(serverSettings, state, activePreset, req),
         adminPath: ADMIN_PUBLIC_PATH,
         now: new Date().toISOString(),
     };
@@ -625,6 +848,34 @@ app.get(/^\/adminvs$/, (req, res) => {
     res.redirect(ADMIN_PUBLIC_PATH);
 });
 
+const sendGameIndex = (req, res) => {
+    setNoStoreHeaders(res);
+    try {
+        res.type("html").send(getRenderedGameIndex(req));
+    } catch (error) {
+        console.error("Failed to render inline game index:", error);
+        res.sendFile(GAME_INDEX_PATH);
+    }
+};
+
+app.get("/", (req, res) => {
+    setNoStoreHeaders(res);
+    res.redirect(302, "/play?boot=20260322-forcefresh-v1");
+});
+
+app.head(["/compat", "/play"], (req, res) => {
+    setNoStoreHeaders(res);
+    res.status(200).end();
+});
+
+app.get(["/compat", "/play"], (req, res) => {
+    sendGameIndex(req, res);
+});
+
+app.get("/index.html", (req, res) => {
+    sendGameIndex(req, res);
+});
+
 app.use((req, res, next) => {
     if (req.path === LEGACY_ADMIN_PREFIX || req.path.startsWith(`${LEGACY_ADMIN_PREFIX}/`)) {
         return res.status(404).end();
@@ -643,6 +894,7 @@ app.use(express.static(runtimeStore.WEB_DIR, {
         if (
             filePath.endsWith(".html")
             || filePath.endsWith(path.join("assets", "js", "main_out.js"))
+            || filePath.endsWith(path.join("assets", "js", "game-client.js"))
             || filePath.endsWith(path.join("assets", "js", "agarvvv-ui.js"))
         ) {
             setNoStoreHeaders(res);
@@ -652,6 +904,31 @@ app.use(express.static(runtimeStore.WEB_DIR, {
 
 const port = process.env.PORT ? Number(process.env.PORT) : 3100;
 const host = process.env.HOST || "127.0.0.1";
+ConnectionDiagnostics.installProcessDiagnostics("web", () => ({
+    host,
+    port,
+    adminSessions: sessions.size,
+    skinCount: runtimeStore.readSkinList().length,
+}));
 app.listen(port, host, () => {
     console.log(`AgarVVV web/admin server listening on http://${host}:${port}`);
+    ConnectionDiagnostics.logEvent("server_runtime_snapshot", ConnectionDiagnostics.buildProcessSnapshot({
+        role: "web",
+        reason: "startup",
+        host,
+        port,
+        adminSessions: sessions.size,
+        skinCount: runtimeStore.readSkinList().length,
+    }));
+    const snapshotTimer = setInterval(() => {
+        ConnectionDiagnostics.logEvent("server_runtime_snapshot", ConnectionDiagnostics.buildProcessSnapshot({
+            role: "web",
+            reason: "interval",
+            host,
+            port,
+            adminSessions: sessions.size,
+            skinCount: runtimeStore.readSkinList().length,
+        }));
+    }, WEB_RUNTIME_SNAPSHOT_INTERVAL_MS);
+    if (typeof snapshotTimer.unref === "function") snapshotTimer.unref();
 });

@@ -90,9 +90,20 @@ class Client {
         if (this.protocol < 4)
             this.server.sendChatMessage(null, this.socket.player, `WARNING: Protocol ${this.protocol} assumed as 4!`);
         if (this.socket._agarResumed && typeof this.socket.player.refreshOwnedCells === "function") {
-            this.socket.player.clientNodes = [];
-            this.socket.player.multiControl.pendingOwnedRefresh = true;
-            this.socket.player.refreshOwnedCells();
+            const controller = this.socket.player.getLinkedController
+                ? this.socket.player.getLinkedController()
+                : this.socket.player;
+            controller.clientNodes = [];
+            controller.viewNodes = [];
+            controller.syncLinkedPlayerState?.();
+            const fallback = controller.cells.length
+                ? controller
+                : (controller.getLivingLinkedPlayers?.()[0] || controller);
+            controller.multiControl.activePlayer = fallback;
+            controller.multiControl.pendingOwnedRefresh = true;
+            controller.refreshOwnedCells();
+            controller.sendDualControlState?.(true);
+            controller.sendMinimapHumans?.(true);
             this.server.sendChatMessage(null, this.socket.player, "Connection restored.");
             this.socket._agarResumed = false;
         }

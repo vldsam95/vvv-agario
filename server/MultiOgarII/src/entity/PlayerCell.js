@@ -9,7 +9,9 @@ class PlayerCell extends Cell {
         return true;
     }
     getSpeed(dist) {
-        let speed = 2.2 * Math.pow(this.radius, -0.45) * 40;
+        const speedBase = this.server.config.playerSpeedBase ?? 2.2;
+        const speedExponent = this.server.config.playerSpeedExponent ?? -0.45;
+        let speed = speedBase * Math.pow(this.radius, speedExponent) * 40;
         speed *= this.server.config.playerSpeed;
         speed = Math.min(dist, speed);
         if (dist != 0) speed /= dist;

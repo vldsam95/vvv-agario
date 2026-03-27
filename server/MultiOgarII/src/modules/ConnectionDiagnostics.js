@@ -1,5 +1,6 @@
 const crypto = require("crypto");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 
 const ROOT_DIR = path.resolve(__dirname, "../../../../");
@@ -48,6 +49,7 @@ const NETWORK_LOOKUP_PROVIDERS = [
 const networkProfileCache = new Map();
 const failedNetworkLookups = new Map();
 const pendingNetworkLookups = new Map();
+const installedProcessDiagnostics = new Set();
 
 function ensureLogDir() {
     fs.mkdirSync(LOG_DIR, {recursive: true});
@@ -83,6 +85,14 @@ function sanitizeInteger(value, min = 0, max = Number.MAX_SAFE_INTEGER) {
     const number = Number(value);
     if (!Number.isFinite(number)) return undefined;
     return Math.max(min, Math.min(max, Math.round(number)));
+}
+
+function sanitizeFloat(value, min = 0, max = Number.MAX_SAFE_INTEGER, decimals = 2) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return undefined;
+    const clamped = Math.max(min, Math.min(max, number));
+    const factor = Math.pow(10, Math.max(0, decimals));
+    return Math.round(clamped * factor) / factor;
 }
 
 function shortenId(value, head = 8, tail = 4) {
@@ -150,6 +160,69 @@ function sanitizeNetworkProfile(rawProfile = {}) {
         countryCode: sanitizeText(rawProfile.countryCode, 16),
         source: sanitizeText(rawProfile.source, 32),
     };
+}
+
+function buildProcessSnapshot(extra = {}) {
+    const memory = typeof process.memoryUsage === "function" ? process.memoryUsage() : {};
+    const loadAvg = typeof os.loadavg === "function" ? os.loadavg() : [0, 0, 0];
+    return Object.assign({
+        pid: process.pid,
+        uptimeSec: sanitizeInteger(process.uptime(), 0, 365 * 24 * 60 * 60),
+        rssMb: sanitizeFloat((memory.rss || 0) / (1024 * 1024), 0, 1024 * 1024),
+        heapUsedMb: sanitizeFloat((memory.heapUsed || 0) / (1024 * 1024), 0, 1024 * 1024),
+        heapTotalMb: sanitizeFloat((memory.heapTotal || 0) / (1024 * 1024), 0, 1024 * 1024),
+        externalMb: sanitizeFloat((memory.external || 0) / (1024 * 1024), 0, 1024 * 1024),
+        arrayBuffersMb: sanitizeFloat((memory.arrayBuffers || 0) / (1024 * 1024), 0, 1024 * 1024),
+        load1: sanitizeFloat(loadAvg[0], 0, 1000),
+        load5: sanitizeFloat(loadAvg[1], 0, 1000),
+        load15: sanitizeFloat(loadAvg[2], 0, 1000),
+    }, extra);
+}
+
+function extractErrorDetails(error) {
+    const source = error instanceof Error ? error : new Error(sanitizeText(error, 240) || "Unknown error");
+    return {
+        errorName: sanitizeText(source.name || "Error", 80),
+        errorMessage: sanitizeText(source.message || error, 240),
+        errorCode: sanitizeText(source.code, 64),
+        stack: sanitizeMultilineText(source.stack || "", 2000),
+    };
+}
+
+function installProcessDiagnostics(role, extraProvider) {
+    const normalizedRole = sanitizeText(role, 48) || "process";
+    const installKey = `${process.pid}:${normalizedRole}`;
+    if (installedProcessDiagnostics.has(installKey)) return;
+    installedProcessDiagnostics.add(installKey);
+
+    const resolveExtra = () => {
+        try {
+            if (typeof extraProvider === "function") {
+                const provided = extraProvider();
+                return provided && typeof provided === "object" ? provided : {};
+            }
+            return extraProvider && typeof extraProvider === "object" ? extraProvider : {};
+        } catch (error) {
+            return {
+                extraProviderError: sanitizeText(error?.message || error, 160),
+            };
+        }
+    };
+
+    process.on("unhandledRejection", (reason) => {
+        logEvent("process_unhandled_rejection", buildProcessSnapshot(Object.assign({
+            role: normalizedRole,
+        }, extractErrorDetails(reason), resolveExtra())));
+    });
+
+    if (typeof process.on === "function" && typeof process.prependListener === "function") {
+        process.on("uncaughtExceptionMonitor", (error, origin) => {
+            logEvent("process_uncaught_exception", buildProcessSnapshot(Object.assign({
+                role: normalizedRole,
+                origin: sanitizeText(origin, 64),
+            }, extractErrorDetails(error), resolveExtra())));
+        });
+    }
 }
 
 function getCachedNetworkProfile(ip) {
@@ -271,14 +344,17 @@ function logEvent(type, payload = {}) {
 }
 
 module.exports = {
+    buildProcessSnapshot,
     LOG_DIR,
     EVENTS_LOG_FILE,
     createId,
     ensureLogDir,
     getCachedNetworkProfile,
+    installProcessDiagnostics,
     logEvent,
     normalizeRequestId,
     normalizeIp,
+    sanitizeFloat,
     sanitizeInteger,
     sanitizeMultilineText,
     sanitizeNetworkProfile,

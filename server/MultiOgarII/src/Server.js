@@ -25,6 +25,15 @@ const UserRoleEnum = require('./enum/UserRoleEnum');
 const RESUME_ID_PATTERN = /^[a-z0-9]{24,64}$/i;
 const WS_HEARTBEAT_INTERVAL_MS = 25000;
 const WS_HEARTBEAT_TIMEOUT_MS = 65000;
+const SERVER_RUNTIME_SNAPSHOT_INTERVAL_MS = 10 * 60 * 1000;
+const BASE_TICK_TIME_MS = 40;
+const RESPAWN_CORPSE_MIN_TICKS = Math.ceil(13000 / BASE_TICK_TIME_MS);
+const BOT_SLOWDOWN_LOAD_THRESHOLD = 0.75;
+const BOT_POPULATION_LOAD_THRESHOLD = 0.8;
+const DUAL_AVATAR_LIMIT = 2;
+const MULTI_SPAWN_ANGLE_SAMPLES = 24;
+const MULTI_SPAWN_RING_LIMIT = 160;
+const MULTI_SPAWN_FALLBACK_ATTEMPTS = 64;
 
 function sanitizeResumeId(value) {
     if (typeof value !== "string") return "";
@@ -39,6 +48,7 @@ function buildWsDiagnosticBase(ws) {
         ip: ws?.remoteAddress || ws?.diagClientIp || "",
         remotePort: ws?.remotePort || ws?._socket?.remotePort || 0,
         origin: ws?.diagOrigin || "",
+        requestHost: ws?.diagRequestHost || "",
         requestUrl: ws?.diagRequestUrl || "",
         resumeId: ws?.diagResumeId || "",
         ticketMode: ws?.diagTicketMode || "unknown",
@@ -88,6 +98,7 @@ class Server {
         this.ticks = 0;
         this.disableSpawn = this.config?.serverEnabled === false;
         this.heartbeatLoopId = 0;
+        this.runtimeSnapshotLoopId = 0;
 
         // Config
         this.runtime = Runtime.loadRuntimeSnapshot();
@@ -113,6 +124,13 @@ class Server {
         // Set border, quad-tree
         this.setBorder(this.config.borderWidth, this.config.borderHeight);
         this.quadTree = new QuadNode(this.border);
+        ConnectionDiagnostics.installProcessDiagnostics("game", () => ({
+            serverPort: this.config?.serverPort,
+            serverName: ConnectionDiagnostics.sanitizeText(this.config?.serverName, 120),
+            selectedPreset: ConnectionDiagnostics.sanitizeText(this.selectedPresetKey, 48),
+            socketCount: this.socketCount,
+            connectedClients: Array.isArray(this.clients) ? this.clients.length : 0,
+        }));
     }
     start() {
         this.timerLoopBind = this.timerLoop.bind(this);
@@ -155,6 +173,7 @@ class Server {
     }
     onHttpServerOpen() {
         this.startHeartbeatLoop();
+        this.startRuntimeSnapshotLoop();
         // Start Main Loop
         setTimeout(this.timerLoopBind, 1);
         // Done
@@ -234,6 +253,50 @@ class Server {
         this.heartbeatLoopId = setInterval(() => {
             this.runHeartbeatSweep();
         }, WS_HEARTBEAT_INTERVAL_MS);
+    }
+    startRuntimeSnapshotLoop() {
+        if (this.runtimeSnapshotLoopId) return;
+        this.logRuntimeSnapshot("startup");
+        this.runtimeSnapshotLoopId = setInterval(() => {
+            this.logRuntimeSnapshot("interval");
+        }, SERVER_RUNTIME_SNAPSHOT_INTERVAL_MS);
+        if (typeof this.runtimeSnapshotLoopId.unref === "function") {
+            this.runtimeSnapshotLoopId.unref();
+        }
+    }
+    logRuntimeSnapshot(reason = "interval") {
+        let connectedHumans = 0;
+        let connectedBots = 0;
+        let connectedMinions = 0;
+        for (const socket of this.clients) {
+            const player = socket?.player;
+            if (!socket || !player || socket.isConnected === false) continue;
+            if (player.isMinion || player.isMi) connectedMinions++;
+            else if (player.isBot) connectedBots++;
+            else connectedHumans++;
+        }
+        ConnectionDiagnostics.logEvent("server_runtime_snapshot", ConnectionDiagnostics.buildProcessSnapshot({
+            role: "game",
+            reason,
+            serverPort: this.config.serverPort,
+            serverName: ConnectionDiagnostics.sanitizeText(this.config.serverName, 120),
+            selectedPreset: ConnectionDiagnostics.sanitizeText(this.selectedPresetKey, 48),
+            socketCount: this.socketCount,
+            connectedHumans,
+            connectedBots,
+            connectedMinions,
+            leaderboardSize: Array.isArray(this.leaderboard) ? this.leaderboard.length : 0,
+            totalNodes: this.nodes.length,
+            playerNodes: this.nodesPlayer.length,
+            foodNodes: this.nodesFood.length,
+            virusNodes: this.nodesVirus.length,
+            ejectedNodes: this.nodesEjected.length,
+            movingNodes: this.movingNodes.length,
+            updateTimeMs: ConnectionDiagnostics.sanitizeFloat(this.updateTime, 0, 60000),
+            updateTimeAvgMs: ConnectionDiagnostics.sanitizeFloat(this.updateTimeAvg, 0, 60000),
+            ticks: ConnectionDiagnostics.sanitizeInteger(this.ticks, 0, Number.MAX_SAFE_INTEGER),
+            worldEnabled: this.config.serverEnabled !== false,
+        }));
     }
     runHeartbeatSweep() {
         const now = Date.now();
@@ -329,13 +392,42 @@ class Server {
         player.isCloseRequested = false;
         player.mouse = player.mouse || new Vec2(0, 0);
         player.inputMouse = player.inputMouse || new Vec2(0, 0);
+        player.pruneLinkedPlayers?.();
+        player.syncLinkedPlayerState?.();
+        const resumeTarget = player.cells.length
+            ? player
+            : (typeof player.getLivingLinkedPlayers === "function"
+                ? (player.getLivingLinkedPlayers()[0] || player)
+                : player);
+        player.multiControl.activePlayer = resumeTarget;
+        player.multiControl.pendingOwnedRefresh = true;
+        player.multiControl.lastDualStateSignature = "";
+        player.multiControl.lastMinimapTick = 0;
+        const resumeAnchor = resumeTarget?.getSelectableCells?.()[0];
+        if (resumeAnchor) {
+            player.mouse.assign(resumeAnchor.position);
+            player.inputMouse.assign(resumeAnchor.position);
+        }
         for (const linked of linkedPlayers) {
             if (!linked) continue;
+            linked.socket = ws;
             linked.clientNodes = [];
+            linked.viewNodes = [];
+            linked.inputMouse = linked.inputMouse || new Vec2(0, 0);
+            linked.mouse = linked.mouse || new Vec2(0, 0);
+            if (resumeAnchor) {
+                linked.mouse.assign(resumeAnchor.position);
+                linked.inputMouse.assign(resumeAnchor.position);
+            }
             if (linked !== player) linked.isRemoved = false;
         }
-        player.multiControl.pendingOwnedRefresh = true;
         player.scramble();
+        for (const linked of linkedPlayers) {
+            if (!linked || linked === player) continue;
+            linked.scrambleX = player.scrambleX;
+            linked.scrambleY = player.scrambleY;
+            linked.scrambleId = player.scrambleId;
+        }
         const index = this.clients.indexOf(previousSocket);
         if (index >= 0) this.clients[index] = ws;
         else this.clients.push(ws);
@@ -353,6 +445,7 @@ class Server {
         const clientIp = WsTicket.getClientIp(req.headers, ws._socket.remoteAddress);
         const userAgent = req.headers["user-agent"] || "";
         const origin = ConnectionDiagnostics.sanitizeText(req.headers.origin, 240);
+        const requestHost = ConnectionDiagnostics.sanitizeText(req.headers.host, 200).toLowerCase();
         const requestUrl = new URL(req.url || "/", "ws://localhost");
         const resumeId = sanitizeResumeId(requestUrl.searchParams.get("resume_id"));
         ws.diagRequestId = ConnectionDiagnostics.normalizeRequestId(req.headers["x-request-id"])
@@ -361,6 +454,7 @@ class Server {
         ws.diagClientIp = clientIp;
         ws.diagUserAgent = ConnectionDiagnostics.sanitizeText(userAgent, 240);
         ws.diagOrigin = origin;
+        ws.diagRequestHost = requestHost;
         ws.diagRequestUrl = ConnectionDiagnostics.sanitizeUrl(req.url || "/");
         ws.diagResumeId = ConnectionDiagnostics.shortenId(resumeId);
         ws.diagConnectedAt = Date.now();
@@ -579,6 +673,70 @@ class Server {
             b: candidate[2],
         };
     }
+    getLoadRatio() {
+        return Math.max(0, (this.updateTimeAvg || 0) / BASE_TICK_TIME_MS);
+    }
+    getBotLoadControl() {
+        const loadRatio = this.getLoadRatio();
+        let aiTickStride = 1;
+        if (loadRatio > 0.95) aiTickStride = 4;
+        else if (loadRatio > 0.85) aiTickStride = 3;
+        else if (loadRatio > BOT_SLOWDOWN_LOAD_THRESHOLD) aiTickStride = 2;
+        let populationFactor = 1;
+        if (loadRatio > BOT_POPULATION_LOAD_THRESHOLD) {
+            const overload = Math.min(1, (loadRatio - BOT_POPULATION_LOAD_THRESHOLD) / 0.6);
+            populationFactor = 1 - overload * 0.65;
+        }
+        return {
+            loadRatio,
+            aiTickStride,
+            populationFactor: Math.max(0.35, populationFactor),
+        };
+    }
+    getHumanMinimapEntries(requestingPlayer) {
+        const requesterController = requestingPlayer?.getLinkedController
+            ? requestingPlayer.getLinkedController()
+            : requestingPlayer;
+        const controllers = new Set();
+        const entries = [];
+        for (const socket of this.clients) {
+            const player = socket?.player;
+            if (!player || player.isBot || player.isMinion || player.isMi || player.isRemoved || player.isRestartOrphan) {
+                continue;
+            }
+            const controller = player.getLinkedController ? player.getLinkedController() : player;
+            if (!controller || controllers.has(controller)) continue;
+            controllers.add(controller);
+            const linkedPlayers = typeof controller.getLinkedPlayers === "function"
+                ? controller.getLinkedPlayers()
+                : [controller];
+            for (const linked of linkedPlayers) {
+                if (!linked || linked.isRemoved || linked.isRestartOrphan || linked.isBot || linked.isMinion || linked.isMi) {
+                    continue;
+                }
+                const cells = Array.isArray(linked.cells)
+                    ? linked.cells.filter((cell) => cell && !cell.isRemoved)
+                    : [];
+                if (!cells.length) continue;
+                const center = cells.reduce(
+                    (average, cell) => average.add(cell.position),
+                    new Vec2(0, 0)
+                ).divide(cells.length);
+                const color = linked.color || controller.color || {r: 255, g: 255, b: 255};
+                entries.push({
+                    x: center.x,
+                    y: center.y,
+                    color: {
+                        r: color.r >>> 0,
+                        g: color.g >>> 0,
+                        b: color.b >>> 0,
+                    },
+                    flags: controller === requesterController ? 0x01 : 0x00,
+                });
+            }
+        }
+        return entries;
+    }
     getHumanClientCount() {
         return this.clients.reduce((count, socket) => {
             if (!socket || !socket.player || socket.player.isBot || socket.player.isMinion || socket.player.isMi) {
@@ -621,11 +779,28 @@ class Server {
         if (!linkedPlayers.includes(target)) {
             return false;
         }
-        const existingCells = target.cells.filter((cell) => cell && !cell.isRemoved);
+        const respawnAnchor = this.getLinkedRespawnAnchorCell(controller, target);
+        const existingCells = this.nodesPlayer.filter((cell) =>
+            cell && !cell.isRemoved && cell.owner === target
+        );
+        const spawnTick = Number.isFinite(target.lastSpawnTick) ? target.lastSpawnTick : null;
+        const aliveTicksFromSpawn = spawnTick == null
+            ? 0
+            : Math.max(0, this.ticks - spawnTick);
+        const aliveTicksFromCells = existingCells.reduce((maxAge, cell) =>
+            Math.max(maxAge, typeof cell.getAge === "function" ? cell.getAge() : 0), 0);
+        const aliveTicks = Math.max(aliveTicksFromSpawn, aliveTicksFromCells);
+        const keepCorpse = existingCells.length > 0 && aliveTicks >= RESPAWN_CORPSE_MIN_TICKS;
         if (existingCells.length) {
-            const orphan = this.createRestartOrphan(target, existingCells);
-            for (const cell of existingCells) {
-                cell.owner = orphan;
+            if (keepCorpse) {
+                const orphan = this.createRestartOrphan(target, existingCells);
+                for (const cell of existingCells) {
+                    cell.owner = orphan;
+                }
+            } else {
+                for (const cell of existingCells) {
+                    this.removeNode(cell);
+                }
             }
         }
         target.cells = [];
@@ -634,8 +809,10 @@ class Server {
         target.spectate = false;
         target.freeRoam = false;
         target.spectateTarget = null;
-        target.viewNodes = [];
-        target.clientNodes = [];
+        if (target !== controller) {
+            target.viewNodes = [];
+            target.clientNodes = [];
+        }
         target._score = 0;
         target._scale = 1;
         target.mergeOverride = false;
@@ -646,7 +823,19 @@ class Server {
             controller.socket.client.pendingSplits = 0;
             controller.socket.client.mouseData = null;
         }
-        this.mode.onPlayerSpawn(this, target);
+        const targetSpawnSize = target.spawnmass || this.config.playerStartSize;
+        let spawnedFromAnchor = false;
+        if (respawnAnchor) {
+            const pos = this.findMultiControlSpawnPos(respawnAnchor, targetSpawnSize);
+            const cell = this.spawnPlayer(target, pos, {
+                size: targetSpawnSize,
+                ignoreEjectedSpawn: true,
+            });
+            spawnedFromAnchor = !!cell;
+        }
+        if (!spawnedFromAnchor) {
+            this.mode.onPlayerSpawn(this, target);
+        }
         if (!target.cells.length) {
             return false;
         }
@@ -786,7 +975,7 @@ class Server {
                 ejectVelocity: this.config.ejectVelocity,
                 playerRecombineTime: this.config.playerRecombineTime,
                 dualControlEnabled: !!this.config.dualControlEnabled,
-                multiControlMaxPilots: this.config.multiControlMaxPilots || 2,
+                multiControlMaxPilots: DUAL_AVATAR_LIMIT,
                 serverRestartMinutes: this.runtime?.serverSettings?.serverRestart || 0,
                 allowSkinUpload: !!this.config.allowSkinUpload,
             },
@@ -1298,6 +1487,7 @@ class Server {
         // Spawn player safely (do not check minions)
         var cell = new Entity.PlayerCell(this, player, pos, size);
         player.isMi ? this.addNode(cell) : this.safeSpawn(cell);
+        player.lastSpawnTick = this.ticks;
         // Set initial mouse coords
         player.mouse.assign(cell.position);
         if (player.inputMouse) player.inputMouse.assign(cell.position);
@@ -1305,46 +1495,173 @@ class Server {
     }
     findMultiControlSpawnPos(anchor, size) {
         if (!anchor) return this.randomPos();
-        const baseDistance = Math.max(size * 4, 180);
-        for (let attempt = 0; attempt < 18; attempt++) {
-            const angle = (Math.PI * 2 * attempt) / 18 + Math.random() * 0.35;
-            const distance = baseDistance + Math.random() * size * 2;
-            const pos = anchor.position.sum(Vec2.fromAngle(angle).product(distance));
-            pos.x = Math.max(this.border.minx + size, Math.min(this.border.maxx - size, pos.x));
-            pos.y = Math.max(this.border.miny + size, Math.min(this.border.maxy - size, pos.y));
-            const probe = {
-                position: pos,
-                radius: size,
+        const spawnRadius = Math.max(1, size || this.config.playerStartSize);
+        const playerGap = Math.max(12, spawnRadius * 0.65);
+        const virusGap = Math.max(16, spawnRadius * 0.8);
+        const queryPadding = Math.max(playerGap, virusGap) + 8;
+        const borderPadding = spawnRadius + 2;
+        const minDistance = anchor.radius + spawnRadius + playerGap;
+        const preferredDistance = minDistance + Math.max(28, spawnRadius * 1.25);
+        const distanceStep = Math.max(22, spawnRadius * 0.95);
+        const maxDistance = Math.max(
+            preferredDistance,
+            Math.hypot(this.border.width, this.border.height)
+        );
+        const ringLimit = Math.max(1, Math.min(
+            MULTI_SPAWN_RING_LIMIT,
+            Math.ceil((maxDistance - preferredDistance) / distanceStep)
+        ));
+        const evaluateCandidate = (candidatePos) => {
+            const queryRadius = spawnRadius + queryPadding;
+            const queryBound = new Quad(
+                candidatePos.x - queryRadius,
+                candidatePos.y - queryRadius,
+                candidatePos.x + queryRadius,
+                candidatePos.y + queryRadius
+            );
+            const nearbyNodes = this.quadTree.allOverlapped(queryBound);
+            let minClearance = Number.POSITIVE_INFINITY;
+            let blockerCount = 0;
+            for (const node of nearbyNodes) {
+                if (!node || node.isRemoved || (node.type !== 0 && node.type !== 2)) {
+                    continue;
+                }
+                const requiredGap = node.type === 2 ? virusGap : playerGap;
+                const requiredDistance = node.radius + spawnRadius + requiredGap;
+                const deltaX = node.position.x - candidatePos.x;
+                const deltaY = node.position.y - candidatePos.y;
+                const distance = Math.sqrt(deltaX * deltaX + deltaY * deltaY);
+                const clearance = distance - requiredDistance;
+                if (clearance < minClearance) minClearance = clearance;
+                if (clearance < 0) blockerCount++;
+            }
+            if (!Number.isFinite(minClearance)) minClearance = queryPadding;
+            return {
+                safe: blockerCount === 0,
+                blockerCount,
+                clearance: minClearance,
             };
-            if (!this.willCollide(probe)) return pos;
+        };
+        let bestFallback = null;
+        for (let ring = 0; ring <= ringLimit; ring++) {
+            const distance = preferredDistance + ring * distanceStep;
+            const sampleCount = MULTI_SPAWN_ANGLE_SAMPLES + Math.min(ring, 12) * 2;
+            const seed = (anchor.nodeId * 31 + this.ticks * 17 + ring * 13) % sampleCount;
+            const angleOffset = (seed / sampleCount) * Math.PI * 2;
+            let ringBest = null;
+            for (let sample = 0; sample < sampleCount; sample++) {
+                const angle = angleOffset + (Math.PI * 2 * sample) / sampleCount;
+                const rawPos = anchor.position.sum(Vec2.fromAngle(angle).product(distance));
+                const pos = new Vec2(
+                    Math.max(this.border.minx + borderPadding, Math.min(this.border.maxx - borderPadding, rawPos.x)),
+                    Math.max(this.border.miny + borderPadding, Math.min(this.border.maxy - borderPadding, rawPos.y))
+                );
+                const evalResult = evaluateCandidate(pos);
+                const deltaX = pos.x - anchor.position.x;
+                const deltaY = pos.y - anchor.position.y;
+                const actualDistance = Math.sqrt(deltaX * deltaX + deltaY * deltaY);
+                const candidate = {
+                    pos,
+                    actualDistance,
+                    clearance: evalResult.clearance,
+                };
+                if (evalResult.safe) {
+                    if (!ringBest ||
+                        actualDistance < ringBest.actualDistance - 1e-6 ||
+                        (Math.abs(actualDistance - ringBest.actualDistance) <= 1e-6 &&
+                            evalResult.clearance > ringBest.clearance)) {
+                        ringBest = candidate;
+                    }
+                    continue;
+                }
+                const fallbackPenalty = evalResult.blockerCount * 5000 +
+                    Math.max(0, -evalResult.clearance) * 50 + actualDistance;
+                if (!bestFallback || fallbackPenalty < bestFallback.penalty) {
+                    bestFallback = {
+                        pos,
+                        penalty: fallbackPenalty,
+                    };
+                }
+            }
+            if (ringBest) return ringBest.pos;
         }
-        return this.randomPos();
+        let randomFallbackSafe = null;
+        for (let attempt = 0; attempt < MULTI_SPAWN_FALLBACK_ATTEMPTS; attempt++) {
+            const randomPos = this.randomPos();
+            const pos = new Vec2(
+                Math.max(this.border.minx + borderPadding, Math.min(this.border.maxx - borderPadding, randomPos.x)),
+                Math.max(this.border.miny + borderPadding, Math.min(this.border.maxy - borderPadding, randomPos.y))
+            );
+            const evalResult = evaluateCandidate(pos);
+            if (!evalResult.safe) continue;
+            const deltaX = pos.x - anchor.position.x;
+            const deltaY = pos.y - anchor.position.y;
+            const actualDistance = Math.sqrt(deltaX * deltaX + deltaY * deltaY);
+            if (!randomFallbackSafe || actualDistance < randomFallbackSafe.distance) {
+                randomFallbackSafe = {
+                    pos,
+                    distance: actualDistance,
+                };
+            }
+        }
+        if (randomFallbackSafe) return randomFallbackSafe.pos;
+        return bestFallback?.pos || this.randomPos();
+    }
+    getLargestPlayerCell(player) {
+        const cells = player?.getSelectableCells?.() || [];
+        let largest = null;
+        for (const cell of cells) {
+            if (!cell || cell.isRemoved) continue;
+            if (!largest || cell.radius > largest.radius) {
+                largest = cell;
+            }
+        }
+        return largest;
+    }
+    getLinkedRespawnAnchorCell(controller, excludedPlayer) {
+        const linkedPlayers = typeof controller?.getLinkedPlayers === "function"
+            ? controller.getLinkedPlayers()
+            : [controller];
+        let largest = null;
+        for (const linked of linkedPlayers) {
+            if (!linked || linked === excludedPlayer || linked.isRemoved || linked.isRestartOrphan) {
+                continue;
+            }
+            const cell = this.getLargestPlayerCell(linked);
+            if (!cell) continue;
+            if (!largest || cell.radius > largest.radius) {
+                largest = cell;
+            }
+        }
+        return largest;
     }
     spawnMultiControlAvatar(player) {
         if (!player || !player.hasAnyLinkedCells?.() || this.disableSpawn || this.config.serverEnabled === false) {
             return null;
         }
         const controller = player.getLinkedController ? player.getLinkedController() : player;
-        const maxPilots = Math.max(1, this.config.multiControlMaxPilots || 2);
-        if (controller.getLivingLinkedPlayers().length >= maxPilots) return null;
+        controller.pruneLinkedPlayers?.();
+        if (controller.getLivingLinkedPlayers().length >= DUAL_AVATAR_LIMIT) return null;
         const activePlayer = controller.getControlledPlayer();
-        const anchor = activePlayer.getSelectableCells()[0];
+        const anchor = this.getLargestPlayerCell(activePlayer);
         if (!anchor) return null;
-        const pos = this.findMultiControlSpawnPos(anchor, this.config.playerStartSize);
         if (!controller.cells.length) {
             controller.isRemoved = false;
-            controller.viewNodes = [];
-            controller.clientNodes = [];
             controller.setSkin(controller._skin);
+            const controllerSpawnSize = controller.spawnmass || this.config.playerStartSize;
+            const pos = this.findMultiControlSpawnPos(anchor, controllerSpawnSize);
             const cell = this.spawnPlayer(controller, pos, {
-                size: this.config.playerStartSize,
+                size: controllerSpawnSize,
                 ignoreEjectedSpawn: true,
             });
             return cell ? controller : null;
         }
         const avatar = controller.attachLinkedPlayer(new Player(this, controller.socket));
+        if (!avatar) return null;
+        const avatarSpawnSize = avatar.spawnmass || this.config.playerStartSize;
+        const pos = this.findMultiControlSpawnPos(anchor, avatarSpawnSize);
         const cell = this.spawnPlayer(avatar, pos, {
-            size: this.config.playerStartSize,
+            size: avatarSpawnSize,
             ignoreEjectedSpawn: true,
         });
         if (!cell) {

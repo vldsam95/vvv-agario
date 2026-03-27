@@ -2,6 +2,25 @@ const Player = require('../Player');
 const Vec2 = require('../modules/Vec2');
 
 const TEAM_BOT_LOGIC = "team-bots";
+const LOGIC_DEFAULTS = Object.freeze({
+    lowPriorityThreatSplitDepth: 3,
+    lowPriorityThreatMassRatio: 11,
+    lowPriorityThreatEatRatio: 1.15,
+    lowPriorityThreatImmediateClearance: 150,
+    lowPriorityThreatFarEdgeDistance: 960,
+    lowPriorityThreatMinFactor: 0.32,
+    lowPriorityThreatMaxFactor: 0.8,
+    lowPriorityThreatBlockFactor: 0.72,
+    lowPriorityThreatAltSearchDistance: 760,
+    lowPriorityThreatAltMassFloor: 0.65,
+    lowPriorityThreatAltPriorityRatio: 0.9,
+    smartSplitMinTotalMass: 1000,
+    smartSplitCaptureMassRatio: 1,
+    smartSplitSearchRadius: 300,
+    smartSplitChainRadius: 260,
+    smartSplitImmediateThreatClearance: 150,
+    smartSplitRiskOverrideCeiling: 1.35,
+});
 
 const LOGIC_PRESETS = Object.freeze({
     balanced: {
@@ -151,10 +170,128 @@ class BotPlayer extends Player {
     }
     getLogicConfig() {
         const logic = this.botProfile?.logic;
-        return LOGIC_PRESETS[logic] || LOGIC_PRESETS.balanced;
+        return Object.assign({}, LOGIC_DEFAULTS, LOGIC_PRESETS[logic] || LOGIC_PRESETS.balanced);
     }
     getTotalMass() {
         return this.cells.reduce((sum, current) => sum + (current?._mass || 0), 0);
+    }
+    getNodeMass(node) {
+        if (!node) return 0;
+        if (typeof node._mass === "number") return node._mass;
+        if (typeof node._radius2 === "number") return node._radius2 / 100;
+        if (typeof node.radius === "number") return (node.radius * node.radius) / 100;
+        return 0;
+    }
+    canConsumeByRadius(hunterRadius, preyRadius, ratio = 1.15) {
+        return hunterRadius > preyRadius * ratio;
+    }
+    getEdgeDistance(left, right, leftRadius = left?.radius || 0, rightRadius = right?.radius || 0) {
+        if (!left?.position || !right?.position) return Infinity;
+        return left.position.difference(right.position).dist() - leftRadius - rightRadius;
+    }
+    canThreatConsumeAfterSplits(threat, cell, splitCount = 3, ratio = 1.15) {
+        if (!threat || !cell) return false;
+        const projectedRadius = threat.radius / Math.pow(Math.SQRT2, splitCount);
+        return this.canConsumeByRadius(projectedRadius, cell.radius, ratio);
+    }
+    getThreatAlternativeTargets(threat, cell, logic) {
+        const targetMass = this.getNodeMass(cell);
+        if (!targetMass) {
+            return {
+                hasMeaningfulAlternative: false,
+                qualifyingCount: 0,
+                qualifyingMass: 0,
+                bestPriority: 0,
+                targetPriority: 0,
+            };
+        }
+        const targetEdgeDistance = Math.max(1, this.getEdgeDistance(threat, cell));
+        const targetPriority = targetMass / Math.max(80, targetEdgeDistance + 80);
+        const searchDistance = Math.max(
+            logic.lowPriorityThreatAltSearchDistance || 760,
+            Math.min(targetEdgeDistance + 160, (logic.lowPriorityThreatAltSearchDistance || 760) * 1.35)
+        );
+        let qualifyingCount = 0;
+        let qualifyingMass = 0;
+        let bestPriority = 0;
+        for (const node of this.viewNodes) {
+            if (!node || node === threat || node === cell || node.type !== 0) continue;
+            if (node.owner === threat.owner) continue;
+            if (this.areFriendlyPlayers(threat.owner, node.owner)) continue;
+            if (!this.canConsumeByRadius(threat.radius, node.radius, logic.lowPriorityThreatEatRatio || 1.15)) continue;
+            const edgeDistance = this.getEdgeDistance(threat, node);
+            if (edgeDistance > searchDistance) continue;
+            const nodeMass = this.getNodeMass(node);
+            if (nodeMass < targetMass * (logic.lowPriorityThreatAltMassFloor || 0.65)) continue;
+            const priority = nodeMass / Math.max(80, Math.max(1, edgeDistance) + 80);
+            if (priority < targetPriority * (logic.lowPriorityThreatAltPriorityRatio || 0.9)) continue;
+            qualifyingCount++;
+            qualifyingMass += nodeMass;
+            if (priority > bestPriority) bestPriority = priority;
+        }
+        return {
+            hasMeaningfulAlternative: qualifyingCount > 0,
+            qualifyingCount,
+            qualifyingMass,
+            bestPriority,
+            targetPriority,
+        };
+    }
+    getThreatResponseFactor(threat, cell, logic) {
+        if (!threat || !cell) return 1;
+        const edgeDistance = this.getEdgeDistance(threat, cell);
+        if (edgeDistance < (logic.lowPriorityThreatImmediateClearance || 150)) return 1;
+        const threatMass = this.getNodeMass(threat);
+        const cellMass = this.getNodeMass(cell);
+        const massRatio = threatMass / Math.max(1, cellMass);
+        if (massRatio < (logic.lowPriorityThreatMassRatio || 11)) return 1;
+        if (!this.canThreatConsumeAfterSplits(
+            threat,
+            cell,
+            logic.lowPriorityThreatSplitDepth || 3,
+            logic.lowPriorityThreatEatRatio || 1.15
+        )) return 1;
+        const alternatives = this.getThreatAlternativeTargets(threat, cell, logic);
+        if (!alternatives.hasMeaningfulAlternative) return 1;
+        const closeDistance = logic.lowPriorityThreatImmediateClearance || 150;
+        const farDistance = logic.lowPriorityThreatFarEdgeDistance || 960;
+        const distanceWeight = Math.max(
+            0,
+            Math.min(1, (edgeDistance - closeDistance) / Math.max(1, farDistance - closeDistance))
+        );
+        const overmatchWeight = Math.min(
+            1,
+            Math.max(0, massRatio - (logic.lowPriorityThreatMassRatio || 11)) /
+                Math.max(1, (logic.lowPriorityThreatMassRatio || 11) * 1.5)
+        );
+        const alternativeWeight = Math.min(
+            1,
+            Math.max(
+                0,
+                alternatives.bestPriority /
+                    Math.max(0.01, alternatives.targetPriority || 0.01) -
+                    (logic.lowPriorityThreatAltPriorityRatio || 0.9)
+            )
+        );
+        let factor = (logic.lowPriorityThreatMaxFactor || 0.8) -
+            distanceWeight * ((logic.lowPriorityThreatMaxFactor || 0.8) - (logic.lowPriorityThreatMinFactor || 0.32));
+        factor -= overmatchWeight * 0.12;
+        factor -= alternativeWeight * 0.08;
+        return Math.max(logic.lowPriorityThreatMinFactor || 0.32, Math.min(1, factor));
+    }
+    isMaterialThreat(node, cell, logic, minFactor = logic.lowPriorityThreatBlockFactor) {
+        return this.getThreatResponseFactor(node, cell, logic) >= minFactor;
+    }
+    buildProjectedSplitCell(cell, target) {
+        if (!cell || !target?.position) return null;
+        const radius = cell.radius / Math.SQRT2;
+        return {
+            owner: cell.owner,
+            position: target.position,
+            radius,
+            _radius2: radius * radius,
+            _mass: (radius * radius) / 100,
+        };
     }
     createEmptyTeamAction() {
         return {
@@ -258,24 +395,119 @@ class BotPlayer extends Player {
         }
         return this.cells.length < (logic.splitCellLimit || this.server.config.playerMaxCells);
     }
-    hasNearbySplitThreat(cell, target, logic) {
-        if (!logic.splitThreatClearance) return false;
-        const postSplitRadius = cell.radius / Math.SQRT2;
+    evaluateSplitThreats(cell, target, logic) {
+        if (!logic.splitThreatClearance) {
+            return {
+                blocked: false,
+                immediateDanger: false,
+                riskScore: 0,
+            };
+        }
+        const postSplitCell = this.buildProjectedSplitCell(cell, target);
+        if (!postSplitCell) {
+            return {
+                blocked: false,
+                immediateDanger: false,
+                riskScore: 0,
+            };
+        }
+        const currentClearance = logic.splitThreatClearance;
+        const postClearance = currentClearance * 0.8;
+        const immediateClearance = logic.smartSplitImmediateThreatClearance || 150;
+        let riskScore = 0;
+        let immediateDanger = false;
         for (const node of this.viewNodes) {
             if (!node || node === target || node.owner == this || node.type !== 0) continue;
             if (this.areFriendlyPlayers(cell.owner, node.owner)) continue;
-            const cellEdgeDistance = node.position.difference(cell.position).dist() - cell.radius - node.radius;
+            const cellEdgeDistance = this.getEdgeDistance(node, cell);
             if (node.radius > cell.radius * (logic.splitThreatRatio || 1.15) &&
-                cellEdgeDistance < logic.splitThreatClearance) {
-                return true;
+                cellEdgeDistance < currentClearance) {
+                const threatFactor = this.getThreatResponseFactor(node, cell, logic);
+                const normalizedDistance = 1 - Math.max(0, cellEdgeDistance) / Math.max(1, currentClearance);
+                riskScore += threatFactor * (0.3 + normalizedDistance * 0.85);
+                if (cellEdgeDistance < immediateClearance &&
+                    threatFactor >= (logic.lowPriorityThreatBlockFactor || 0.72)) {
+                    immediateDanger = true;
+                }
             }
-            const targetEdgeDistance = node.position.difference(target.position).dist() - postSplitRadius - node.radius;
-            if (node.radius > postSplitRadius * (logic.postSplitThreatRatio || 1.15) &&
-                targetEdgeDistance < logic.splitThreatClearance * 0.8) {
-                return true;
+            const targetEdgeDistance = this.getEdgeDistance(node, postSplitCell);
+            if (node.radius > postSplitCell.radius * (logic.postSplitThreatRatio || 1.15) &&
+                targetEdgeDistance < postClearance) {
+                const threatFactor = this.getThreatResponseFactor(node, postSplitCell, logic);
+                const normalizedDistance = 1 - Math.max(0, targetEdgeDistance) / Math.max(1, postClearance);
+                riskScore += threatFactor * (0.45 + normalizedDistance);
+                if (targetEdgeDistance < immediateClearance &&
+                    threatFactor >= (logic.lowPriorityThreatBlockFactor || 0.72) * 0.92) {
+                    immediateDanger = true;
+                }
             }
         }
-        return false;
+        return {
+            blocked: immediateDanger || riskScore >= 1,
+            immediateDanger,
+            riskScore,
+        };
+    }
+    estimateSplitCaptureMass(cell, primaryTarget, logic) {
+        if (!cell || !primaryTarget || primaryTarget.type !== 0 || !primaryTarget.position) return null;
+        const projectedSplitCell = this.buildProjectedSplitCell(cell, primaryTarget);
+        if (!projectedSplitCell) return null;
+        let projectedMass = projectedSplitCell._mass;
+        let projectedRadius = projectedSplitCell.radius;
+        let capturableMass = 0;
+        let capturedCount = 0;
+        const anchorPosition = primaryTarget.position;
+        const searchRadius = Math.max(
+            logic.smartSplitSearchRadius || 300,
+            projectedRadius * 3.2,
+            primaryTarget.radius * 4.2
+        );
+        const chainRadius = Math.max(logic.smartSplitChainRadius || 260, projectedRadius * 1.8);
+        const candidates = [];
+        for (const node of this.viewNodes) {
+            if (!node || node.owner == this || node.type !== 0) continue;
+            if (this.areFriendlyPlayers(cell.owner, node.owner)) continue;
+            const edgeDistance = node.position.difference(anchorPosition).dist() - node.radius;
+            if (node !== primaryTarget && edgeDistance > searchRadius) continue;
+            candidates.push({
+                node,
+                edgeDistance,
+                isPrimary: node === primaryTarget,
+            });
+        }
+        candidates.sort((left, right) => {
+            if (left.isPrimary && !right.isPrimary) return -1;
+            if (!left.isPrimary && right.isPrimary) return 1;
+            return left.edgeDistance - right.edgeDistance;
+        });
+        for (const candidate of candidates) {
+            const node = candidate.node;
+            const edgeDistance = node.position.difference(anchorPosition).dist() - node.radius;
+            const dynamicReach = Math.max(searchRadius, projectedRadius * 3.4, chainRadius + capturedCount * 24);
+            if (!candidate.isPrimary && edgeDistance > dynamicReach) continue;
+            if (!this.canConsumeByRadius(projectedRadius, node.radius, logic.lowPriorityThreatEatRatio || 1.15)) continue;
+            const nodeMass = this.getNodeMass(node);
+            capturableMass += nodeMass;
+            capturedCount++;
+            projectedMass += nodeMass;
+            projectedRadius = Math.sqrt(projectedMass * 100);
+        }
+        return {
+            capturableMass,
+            capturedCount,
+            projectedMass,
+            projectedRadius,
+        };
+    }
+    canJustifyAggressiveSplit(node, cell, logic, totalMass, splitThreatState) {
+        if (!splitThreatState || splitThreatState.immediateDanger) return false;
+        if (this.cells.length !== 1) return false;
+        if (totalMass < (logic.smartSplitMinTotalMass || 1000)) return false;
+        if (!node || node.type !== 0 || this.areFriendlyPlayers(cell.owner, node.owner)) return false;
+        const captureEstimate = this.estimateSplitCaptureMass(cell, node, logic);
+        if (!captureEstimate || captureEstimate.capturedCount < 1) return false;
+        if (captureEstimate.capturableMass < totalMass * (logic.smartSplitCaptureMassRatio || 1)) return false;
+        return splitThreatState.riskScore <= (logic.smartSplitRiskOverrideCeiling || 1.35);
     }
     canSplitOnNode(node, cell, logic, influence, distance, totalMass) {
         if (node.type == 1 || this.splitCooldown) return false;
@@ -286,7 +518,11 @@ class BotPlayer extends Player {
         const splitRatio = logic.splitAdvantageRatio || 1.15;
         if (cell.radius <= node.radius * splitRatio) return false;
         if (400 * logic.splitDistanceFactor - cell.radius / 2 - node.radius < distance) return false;
-        if (this.hasNearbySplitThreat(cell, node, logic)) return false;
+        const splitThreatState = this.evaluateSplitThreats(cell, node, logic);
+        if (splitThreatState.blocked &&
+            !this.canJustifyAggressiveSplit(node, cell, logic, totalMass, splitThreatState)) {
+            return false;
+        }
         return true;
     }
     isEnemyThreatNode(node, cell, ratio = 1.15) {
@@ -520,7 +756,8 @@ class BotPlayer extends Player {
         for (const node of this.viewNodes) {
             if (!this.isEnemyThreatNode(node, cell, logic.teamThreatRatio || 1.1)) continue;
             const edgeDistance = node.position.difference(cell.position).dist() - cell.radius - node.radius;
-            if (edgeDistance < (logic.teamThreatClearance || 0)) return true;
+            if (edgeDistance < (logic.teamThreatClearance || 0) &&
+                this.isMaterialThreat(node, cell, logic)) return true;
         }
         return false;
     }
@@ -827,6 +1064,11 @@ class BotPlayer extends Player {
         if (this.splitCooldown) --this.splitCooldown;
         const cell = this.largest(this.cells);
         if (!cell) return;
+        const loadControl = this.server.getBotLoadControl?.();
+        const aiTickStride = Math.max(1, (loadControl?.aiTickStride | 0) || 1);
+        if (aiTickStride > 1 && ((this.server.ticks + this.pID) % aiTickStride) !== 0) {
+            return;
+        }
         const logic = this.getLogicConfig();
         const totalMass = this.getTotalMass();
         this.decide(cell, logic, totalMass);
@@ -858,7 +1100,8 @@ class BotPlayer extends Player {
                         bestPrey = prey;
                     }
                 } else if (node.radius > cell.radius * (logic.teamThreatRatio || 1.1) &&
-                    edgeDistance < (logic.teamThreatClearance || 0)) {
+                    edgeDistance < (logic.teamThreatClearance || 0) &&
+                    this.isMaterialThreat(node, cell, logic)) {
                     urgentThreat = true;
                 }
             }
@@ -916,8 +1159,11 @@ class BotPlayer extends Player {
                     return 0;
                 }
                 if (cell.radius > node.radius * 1.15) return node.radius * logic.edibleWeight;
-                if (node.radius > cell.radius * 1.15) return -node.radius * logic.threatWeight;
-                return -((node.radius / cell.radius) / 3) * logic.threatWeight;
+                if (node.radius > cell.radius * 1.15) {
+                    return -node.radius * logic.threatWeight * this.getThreatResponseFactor(node, cell, logic);
+                }
+                return -((node.radius / cell.radius) / 3) * logic.threatWeight *
+                    this.getThreatResponseFactor(node, cell, logic);
             case 1:
                 return logic.foodWeight;
             case 2:
